@@ -74,10 +74,23 @@ func (m *Manager) RunHook(hookScript, workspace, issueID, identifier string) err
 		return nil
 	}
 
+	// Replace template variables
+	replacements := map[string]string{
+		"{{.Workspace}}": workspace,
+		"{{.TaskID}}":   issueID,
+		"{{.IssueID}}":  issueID,
+		"{{.Identifier}}": identifier,
+	}
+
+	result := hookScript
+	for placeholder, value := range replacements {
+		result = strings.ReplaceAll(result, placeholder, value)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), m.hookTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", hookScript)
+	cmd := exec.CommandContext(ctx, "sh", "-c", result)
 	cmd.Dir = workspace
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

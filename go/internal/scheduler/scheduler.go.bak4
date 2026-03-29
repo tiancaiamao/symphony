@@ -2,17 +2,13 @@
 package scheduler
 
 import (
+	"encoding/json"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"symphonia/internal/agent"
@@ -22,52 +18,6 @@ import (
 	"symphonia/internal/store"
 	"symphonia/internal/workspace"
 )
-
-// processExists checks if a process with the given PID is running and not a zombie
-func processExists(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	
-	if runtime.GOOS == "windows" {
-		// Windows: use tasklist
-		cmd := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid))
-		return cmd.Run() == nil
-	}
-	
-	// Unix-like systems: use ps to check process state
-	if runtime.GOOS == "darwin" {
-		// macOS: use ps -o state
-		cmd := exec.Command("ps", "-o", "state=", "-p", fmt.Sprintf("%d", pid))
-		output, err := cmd.Output()
-		if err != nil {
-			return false // Process not found
-		}
-		state := strings.TrimSpace(string(output))
-		// Check for zombie (Z) or empty state
-		return state != "" && state != "Z"
-	}
-	
-	// Linux: use /proc/<pid>/stat to check process state
-	if statBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
-		// Format: pid (comm) state ...
-		fields := strings.Fields(string(statBytes))
-		if len(fields) >= 3 {
-			state := fields[2]
-			// Z = zombie, D = uninterruptible sleep (disk wait)
-			return state != "Z"
-		}
-		return false
-	}
-	
-	// Fallback: use kill(pid, 0) to check existence
-	err := syscall.Kill(pid, 0)
-	if err == syscall.ESRCH {
-		return false // No such process
-	}
-	// EPERM means process exists but we don't have permission, assume alive
-	return true
-}
 
 // Scheduler manages task execution and state transitions.
 type Scheduler struct {
@@ -217,57 +167,9 @@ func (s *Scheduler) handleRunningTask(ctx context.Context, task *store.Task) {
 	s.mu.RUnlock()
 
 	if !exists {
-		// Check if the agent process is actually running
-		if task.AgentPID > 0 {
-			// Verify if the process exists
-			if processExists(task.AgentPID) {
-				// Process is running but not in our map - likely a server restart
-				// Try to track it by loading agent info from workspace
-				logging.Info("Found running agent after restart, re-tracking",
-					logging.String("task_id", task.ID),
-					logging.Int("pid", task.AgentPID))
-				
-				// Create a RunningTask entry for the existing process
-				ag, err := factory.NewAgent(s.cfg.Agent.Kind, s.cfg.Agent.Command, s.cfg.Agent.Args, task.Workspace)
-				if err != nil {
-					logging.ErrLog("Failed to create agent reference", logging.Err(err))
-					return
-				}
-				
-				var startTime time.Time
-				if task.StartedAt != nil {
-					startTime = *task.StartedAt
-				} else {
-					startTime = time.Now()
-				}
-				
-				rt := &RunningTask{
-					Task:      task,
-					Agent:     ag,
-					CancelFunc: func() {
-						// Cancel will be called via syscall kill when needed
-						if task.AgentPID > 0 {
-							syscall.Kill(task.AgentPID, syscall.SIGTERM)
-						}
-					},
-					StartTime: startTime,
-				}
-				
-				s.mu.Lock()
-				s.running[task.ID] = rt
-				s.mu.Unlock()
-				
-				logging.Info("Re-tracked running task",
-					logging.String("task_id", task.ID),
-					logging.Int("pid", task.AgentPID))
-				return
-			}
-		}
-		
-		// Task is marked running but not in our map and process is dead - orphaned state
+		// Task is marked running but not in our map - orphaned state
 		logging.Warn("Found orphaned running task, marking as failed",
-			logging.String("task_id", task.ID),
-			logging.Int("agent_pid", task.AgentPID))
+			logging.String("task_id", task.ID))
 		store.UpdateTaskState(s.db, task.ID, store.StateFailed, "Orphaned task: not found in scheduler")
 		return
 	}
@@ -475,73 +377,69 @@ func (s *Scheduler) processRetries(ctx context.Context) {
 
 // startTask begins execution of a task.
 func (s *Scheduler) startTask(ctx context.Context, task *store.Task) {
-	// Create workspace - only clean it for new tasks (todo state)
-	// For self-review and address-comment, preserve the existing workspace
+	// Generate workspace
+	wsPath := s.workspace.WorkspaceForIssue(task.ID)
+
+	// Create workspace
 	if err := s.workspace.EnsureRoot(); err != nil {
 		logging.ErrLog("Failed to ensure workspace root", logging.Err(err))
 		store.UpdateTaskState(s.db, task.ID, store.StateFailed, fmt.Sprintf("Workspace error: %v", err))
 		return
 	}
 
-	// Check if we need to create a new workspace
-	needCreate := false
-	var wsPath string
-
-	if task.State == store.StateTodo {
-		// Always create clean workspace for new tasks
-		needCreate = true
-	} else {
-		// For retry, self-review, and address-comment, check if workspace is valid
-		if task.Workspace == "" {
-			needCreate = true
-			logging.Warn("Task has no workspace, creating new one",
-				logging.String("task_id", task.ID),
-				logging.String("state", string(task.State)))
-		} else {
-			// Check if workspace contains WORKFLOW.md (indicates valid git worktree)
-			workflowPath := filepath.Join(task.Workspace, "WORKFLOW.md")
-			if _, err := os.Stat(workflowPath); os.IsNotExist(err) {
-				// Workspace is incomplete, recreate it
-				needCreate = true
-				logging.Warn("Workspace is incomplete (no WORKFLOW.md), recreating",
-					logging.String("task_id", task.ID),
-					logging.String("workspace", task.Workspace))
-			} else {
-				// Workspace is valid, use existing one
-				wsPath = task.Workspace
-			}
-		}
+	// Create task workspace
+	ws, err := s.workspace.CreateForIssue(task.ID, task.ID)
+	if err != nil {
+		logging.ErrLog("Failed to create workspace", logging.Err(err))
+		store.UpdateTaskState(s.db, task.ID, store.StateFailed, fmt.Sprintf("Workspace error: %v", err))
+		return
 	}
+	wsPath = ws
 
-	if needCreate {
-		// Clean up any existing worktree for this task to avoid conflicts
-		if s.cfg.Hooks.BeforeRemove != "" {
-			// Use before_remove hook to clean up old worktree
-			oldWsPath := s.workspace.WorkspaceForIssue(task.ID)
-			if _, err := os.Stat(oldWsPath); err == nil {
-				if err := s.workspace.RunHook(s.cfg.Hooks.BeforeRemove, oldWsPath, task.ID, task.ID); err != nil {
-					logging.Warn("Failed to cleanup old workspace", logging.Err(err))
-				}
-			}
-		}
-
-		// Create clean workspace
-		ws, err := s.workspace.CreateForIssue(task.ID, task.ID)
-		if err != nil {
-			logging.ErrLog("Failed to create workspace", logging.Err(err))
-			store.UpdateTaskState(s.db, task.ID, store.StateFailed, fmt.Sprintf("Workspace error: %v", err))
+	// Run after_create hook
+	if s.cfg.Hooks.AfterCreate != "" {
+		logging.Info("Running after_create hook", logging.String("task_id", task.ID))
+		if err := s.workspace.RunHook(s.cfg.Hooks.AfterCreate, wsPath, task.ID, task.ID); err != nil {
+			logging.ErrLog("Failed to run after_create hook", logging.String("task_id", task.ID), logging.Err(err))
+			store.UpdateTaskState(s.db, task.ID, store.StateFailed, fmt.Sprintf("Hook error: %v", err))
+			s.workspace.Remove(wsPath)
 			return
 		}
-		wsPath = ws
+	}
 
-		// Run after_create hook (git worktree setup)
-		if s.cfg.Hooks.AfterCreate != "" {
-			if err := s.workspace.RunHook(s.cfg.Hooks.AfterCreate, wsPath, task.ID, task.ID); err != nil {
-				logging.Warn("Failed to run after_create hook", logging.Err(err))
-			}
+	// Run before_run hook
+		logging.Info("Checking after_create hook", logging.String("hook", s.cfg.Hooks.AfterCreate), logging.Bool("notEmpty", s.cfg.Hooks.AfterCreate != ""))
+	if s.cfg.Hooks.BeforeRun != "" {
+		logging.Info("Running before_run hook", logging.String("task_id", task.ID))
+		if err := s.workspace.RunHook(s.cfg.Hooks.BeforeRun, wsPath, task.ID, task.ID); err != nil {
+			logging.ErrLog("Failed to run before_run hook", logging.String("task_id", task.ID), logging.Err(err))
+			store.UpdateTaskState(s.db, task.ID, store.StateFailed, fmt.Sprintf("Hook error: %v", err))
+			s.workspace.Remove(wsPath)
+			return
 		}
 	}
 
+	// Create agent first
+	ag, err := factory.NewAgent(s.cfg.Agent.Kind, s.cfg.Agent.Command, s.cfg.Agent.Args, wsPath)
+	if err != nil {
+		logging.ErrLog("Failed to create agent", logging.Err(err))
+		store.UpdateTaskState(s.db, task.ID, store.StateFailed, fmt.Sprintf("Agent error: %v", err))
+		s.workspace.Remove(wsPath)
+		return
+	}
+	
+	// Create running task and add to map BEFORE database update
+	taskCtx, cancel := context.WithCancel(ctx)
+	rt := &RunningTask{
+		Task:       task,
+		Agent:      ag,
+		CancelFunc: cancel,
+		StartTime:  time.Now(),
+	}
+	s.mu.Lock()
+	s.running[task.ID] = rt
+	s.mu.Unlock()
+	
 	// Update task state and workspace
 	if err := store.UpdateTaskState(s.db, task.ID, store.StateRunning, ""); err != nil {
 		logging.ErrLog("Failed to transition task to running", logging.Err(err))
@@ -554,52 +452,17 @@ func (s *Scheduler) startTask(ctx context.Context, task *store.Task) {
 		logging.String("title", task.Title),
 		logging.String("workspace", wsPath))
 
-	// Create agent
-	ag, err := factory.NewAgent(s.cfg.Agent.Kind, s.cfg.Agent.Command, s.cfg.Agent.Args, wsPath)
-	if err != nil {
-		logging.ErrLog("Failed to create agent", logging.Err(err))
-		store.UpdateTaskState(s.db, task.ID, store.StateFailed, fmt.Sprintf("Agent error: %v", err))
-		s.workspace.Remove(wsPath)
-		return
-	}
-
-	// Create cancellable context
-	taskCtx, cancel := context.WithCancel(ctx)
-
-	rt := &RunningTask{
-		Task:       task,
-		Agent:      ag,
-		CancelFunc: cancel,
-		StartTime:  time.Now(),
-	}
-
-	// Update task state and workspace BEFORE adding to running map
-	// This ensures handleRunningTask will find the task in the map after state transition
-	if err := store.UpdateTaskState(s.db, task.ID, store.StateRunning, ""); err != nil {
-		logging.ErrLog("Failed to transition task to running", logging.Err(err))
-		cancel()
-		return
-	}
-	store.SetTaskWorkspace(s.db, task.ID, wsPath)
-
-	// Add to running map BEFORE starting goroutine
-	// This prevents race condition where handleRunningTask checks the map before goroutine starts
-	s.mu.Lock()
-	s.running[task.ID] = rt
-	s.mu.Unlock()
-
 	// Start task in goroutine
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer func() {
+			s.mu.Lock()
+			delete(s.running, task.ID)
+			s.mu.Unlock()
+		}()
+
 		s.runTask(taskCtx, rt, task, wsPath)
-		
-		// Remove from running map after completion
-		s.mu.Lock()
-		delete(s.running, task.ID)
-		s.mu.Unlock()
-		
-		logging.Debug("Task removed from running map", logging.String("task_id", task.ID))
 	}()
 }
 
@@ -616,19 +479,8 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 		return
 	}
 
-	// Set agent PID if available
-	// This allows us to track the process after server restart
-	if aiAgent, ok := rt.Agent.(interface{ PID() int }); ok {
-		if pid := aiAgent.PID(); pid > 0 {
-			if err := store.SetTaskPID(s.db, task.ID, pid); err != nil {
-				logging.Warn("Failed to set agent PID", logging.Err(err))
-			} else {
-				logging.Info("Set agent PID",
-					logging.String("task_id", task.ID),
-					logging.Int("pid", pid))
-			}
-		}
-	}
+	// Set PID if available
+	// store.SetTaskPID(s.db, task.ID, pid)
 
 	// Build prompt from WORKFLOW.md
 	prompt := s.buildPrompt(task)
@@ -644,20 +496,8 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 		switch event.Type {
 		case agent.EventAgentEnd:
 			logging.Info("Task completed successfully", logging.String("task_id", task.ID))
-
-			// Remove from running map BEFORE updating database to prevent orphaned task race
-			s.mu.Lock()
-			delete(s.running, task.ID)
-			s.mu.Unlock()
-
-			// Transition based on current state:
-			// - Self review tasks complete directly to Done
-			// - Other tasks transition to Self Review
-			if task.State == store.StateSelfReview || task.State == store.StateAddressComment {
-				store.UpdateTaskState(s.db, task.ID, store.StateDone, "")
-			} else {
-				store.UpdateTaskState(s.db, task.ID, store.StateSelfReview, "")
-			}
+			// Transition to Self Review instead of Done
+			store.UpdateTaskState(s.db, task.ID, store.StateSelfReview, "")
 			return
 
 		case agent.EventError:
@@ -666,12 +506,6 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 				errMsg = errData
 			}
 			logging.ErrLog("Task failed with error", logging.String("task_id", task.ID), logging.String("error", errMsg))
-
-			// Remove from running map BEFORE updating database to prevent orphaned task race
-			s.mu.Lock()
-			delete(s.running, task.ID)
-			s.mu.Unlock()
-
 			s.handleTaskFailure(task, fmt.Errorf("%s", errMsg))
 			return
 		}
@@ -758,7 +592,6 @@ func (s *Scheduler) RetryTask(ctx context.Context, taskID string) error {
 	if err := store.UpdateTaskState(s.db, taskID, store.StateRunning, ""); err != nil {
 		return fmt.Errorf("update task state: %w", err)
 	}
-	task.State = store.StateRunning
 
 	// Start the task
 	s.startTask(ctx, task)
@@ -768,25 +601,13 @@ func (s *Scheduler) RetryTask(ctx context.Context, taskID string) error {
 
 // buildPrompt constructs the agent prompt from WORKFLOW.md
 func (s *Scheduler) buildPrompt(task *store.Task) string {
-	// Try to read WORKFLOW.md from the task's workspace
-	var workflowContent string
-	var err error
-
-	if task.Workspace != "" {
-		workflowPath := filepath.Join(task.Workspace, "WORKFLOW.md")
-		content, readErr := os.ReadFile(workflowPath)
-		if readErr == nil {
-			workflowContent = string(content)
-		} else {
-			err = readErr
-		}
-	}
-
-	if workflowContent == "" {
+	// Try to read WORKFLOW.md from workspace root
+	workflowPath := "WORKFLOW.md"
+	workflowContent, err := s.workspace.ReadWorkflow(workflowPath)
+	if err != nil {
 		// Fallback to simple prompt if WORKFLOW.md not found
 		logging.Warn("WORKFLOW.md not found, using default prompt",
 			logging.String("task_id", task.ID),
-			logging.String("workspace", task.Workspace),
 			logging.Err(err))
 
 		return fmt.Sprintf(`You are working on the following task:

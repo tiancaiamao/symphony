@@ -67,6 +67,16 @@ type AIAgent struct {
 
 func (a *AIAgent) Name() string { return "ai" }
 
+// PID returns the process ID of the running agent, or 0 if not running
+func (a *AIAgent) PID() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.cmd != nil && a.cmd.Process != nil {
+		return a.cmd.Process.Pid
+	}
+	return 0
+}
+
 func (a *AIAgent) StartSession(ctx context.Context, cfg agent.SessionConfig) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
