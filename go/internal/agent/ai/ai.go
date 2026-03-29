@@ -136,6 +136,8 @@ func (a *AIAgent) readStdout() {
 	for {
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
+			// Send agent_end event when stdout closes or decoding fails
+			a.events <- agent.Event{Type: agent.EventAgentEnd, Data: nil}
 			return
 		}
 		var base struct{ Type string }
