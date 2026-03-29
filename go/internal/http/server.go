@@ -2,6 +2,7 @@
 package http
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"time"
 
 	"symphonia/internal/api"
 	"symphonia/internal/scheduler"
@@ -26,6 +28,7 @@ type Server struct {
 	templates *template.Template
 	handlers  *api.Handlers
 	webFS     http.FileSystem
+	server    *http.Server
 }
 
 // New creates a new HTTP server.
@@ -42,6 +45,16 @@ func New(port int, db *sql.DB, sched *scheduler.Scheduler) *Server {
 		webFS:     http.FS(subFS),
 	}
 	s.setupRoutes()
+
+	// Create http.Server
+	s.server = &http.Server{
+		Addr:         s.addr,
+		Handler:      s.mux,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
 	return s
 }
 
@@ -108,12 +121,24 @@ func (s *Server) handleBoard(w http.ResponseWriter, r *http.Request) {
 
 // Start begins serving HTTP requests.
 func (s *Server) Start() error {
-	return http.ListenAndServe(s.addr, s.mux)
+	fmt.Printf("[HTTP] Starting server on %s\n", s.server.Addr)
+	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }
 
 // Stop gracefully stops the server.
 func (s *Server) Stop() error {
-	// TODO: implement graceful shutdown
+	fmt.Printf("[HTTP] Shutting down server...\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := s.server.Shutdown(ctx); err != nil {
+		fmt.Printf("[HTTP] Shutdown error: %v\n", err)
+		return err
+	}
+	fmt.Printf("[HTTP] Server stopped\n")
 	return nil
 }
 

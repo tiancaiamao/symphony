@@ -153,20 +153,26 @@ function renderColumn(state, tasks) {
 
 function renderTaskCard(task) {
     const timeAgo = formatTimeAgo(new Date(task.created_at));
-    const retryBadge = task.retry_count > 0 
-        ? `<span class="task-retry-count">retry ${task.retry_count}</span>` 
+    const retryBadge = task.retry_count > 0
+        ? `<span class="task-retry-count">retry ${task.retry_count}</span>`
         : '';
-    
+
     // PR badge
     let prBadge = '';
     if (task.pr_number > 0) {
         const prIcon = task.pr_state === 'merged' ? '✅' : task.pr_state === 'closed' ? '❌' : '🔀';
         const prText = `${prIcon} PR #${task.pr_number}`;
-        prBadge = task.pr_url 
+        prBadge = task.pr_url
             ? `<a href="${escapeHtml(task.pr_url)}" target="_blank" class="task-pr-link" onclick="event.stopPropagation()">${prText}</a>`
             : `<span class="task-pr">${prText}</span>`;
     }
-    
+
+    // Error message for failed tasks
+    let errorBadge = '';
+    if (task.state === 'failed' && task.last_error) {
+        errorBadge = `<div class="task-error" onclick="event.stopPropagation()">❌ ${escapeHtml(task.last_error.substring(0, 100))}${task.last_error.length > 100 ? '...' : ''}</div>`;
+    }
+
     return `
         <div class="task-card ${task.state}" data-id="${task.id}" draggable="true">
             <div class="task-title">${escapeHtml(task.title)}</div>
@@ -175,6 +181,7 @@ function renderTaskCard(task) {
                 ${retryBadge}
             </div>
             ${prBadge ? `<div class="task-pr-info">${prBadge}</div>` : ''}
+            ${errorBadge}
         </div>
     `;
 }
@@ -207,9 +214,18 @@ async function openTaskModal(id) {
         document.getElementById('task-title').value = task.title;
         document.getElementById('task-description').value = task.description || '';
         document.getElementById('task-state').value = task.state;
-        
+
+        // Show error message if task failed
+        const errorGroup = document.getElementById('error-group');
+        if (task.last_error) {
+            document.getElementById('task-error').value = task.last_error;
+            errorGroup.style.display = 'block';
+        } else {
+            errorGroup.style.display = 'none';
+        }
+
         document.getElementById('delete-btn').classList.remove('hidden');
-        
+
         if (task.state === 'failed') {
             document.getElementById('retry-btn').classList.remove('hidden');
         } else {

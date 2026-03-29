@@ -81,9 +81,9 @@ func (a *AIAgent) StartSession(ctx context.Context, cfg agent.SessionConfig) err
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// Debug log the command being executed
-	fmt.Printf("[DEBUG] Starting agent: %s %v\n", a.cmd.Path, a.cmd.Args)
-	fmt.Printf("[DEBUG] Working directory: %s\n", a.cmd.Dir)
+	// Debug: log command details
+	fmt.Printf("[AGENT] Starting: %s %v\n", a.cmd.Path, a.cmd.Args)
+	fmt.Printf("[AGENT] Working directory: %s\n", a.cmd.Dir)
 
 	// Set environment variables
 	if len(cfg.Env) > 0 {
@@ -95,13 +95,14 @@ func (a *AIAgent) StartSession(ctx context.Context, cfg agent.SessionConfig) err
 			env = append(env, fmt.Sprintf("%s=%s", k, v))
 		}
 		a.cmd.Env = env
+		fmt.Printf("[AGENT] Environment variables set: %d\n", len(cfg.Env))
 	}
 
 	if err := a.cmd.Start(); err != nil {
 		return fmt.Errorf("start process: %w", err)
 	}
 
-	fmt.Printf("[DEBUG] Agent started successfully (PID: %d)\n", a.cmd.Process.Pid)
+	fmt.Printf("[AGENT] Started successfully (PID: %d)\n", a.cmd.Process.Pid)
 	go a.readStdout()
 	return nil
 }
@@ -137,25 +138,37 @@ func (a *AIAgent) send(msg interface{}) error {
 	if err != nil {
 		return err
 	}
+	fmt.Printf("[AGENT SEND] Sending message: %s\n", string(data))
 	_, err = a.stdin.Write(append(data, '\n'))
+	if err != nil {
+		fmt.Printf("[AGENT SEND] Write error: %v\n", err)
+	}
 	return err
 }
 
 func (a *AIAgent) readStdout() {
 	dec := json.NewDecoder(a.stdout)
+	fmt.Printf("[AGENT STDOUT] Starting to read events\n")
 	for {
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
 			// Send agent_end event when stdout closes or decoding fails
-			a.events <- agent.Event{Type: agent.EventAgentEnd, Data: nil}
+			fmt.Printf("[AGENT STDOUT] Stream closed or error: %v\n", err)
+			select {
+			case a.events <- agent.Event{Type: agent.EventAgentEnd, Data: nil}:
+			case <-a.done:
+				return
+			}
 			return
 		}
 		var base struct{ Type string }
 		if json.Unmarshal(raw, &base) != nil {
+			fmt.Printf("[AGENT STDOUT] Failed to parse event type: %s\n", string(raw))
 			continue
 		}
 		var data map[string]interface{}
 		json.Unmarshal(raw, &data)
+		fmt.Printf("[AGENT STDOUT] Event: %s\n", base.Type)
 		select {
 		case a.events <- agent.Event{Type: base.Type, Data: data, Raw: raw}:
 		case <-a.done:
@@ -167,7 +180,11 @@ func (a *AIAgent) readStdout() {
 func (a *AIAgent) readStderr(stderr io.Reader) {
 	sc := bufio.NewScanner(stderr)
 	for sc.Scan() {
-		// Log stderr for debugging
-		fmt.Printf("[AGENT STDERR] %s\n", sc.Text())
+		// Log stderr for debugging - this is crucial for troubleshooting
+		line := sc.Text()
+		fmt.Printf("[AGENT STDERR] %s\n", line)
+	}
+	if err := sc.Err(); err != nil {
+		fmt.Printf("[AGENT STDERR] Read error: %v\n", err)
 	}
 }

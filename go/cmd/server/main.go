@@ -110,7 +110,9 @@ func main() {
 	fmt.Println("   Kanban UI: http://localhost:8080/board")
 	fmt.Println("   API:       http://localhost:8080/api/tasks")
 	fmt.Println("   Health:    http://localhost:8080/health")
-	fmt.Println("\n   Press Ctrl+C to stop\n")
+	fmt.Println()
+	fmt.Println("   Press Ctrl+C to stop")
+	fmt.Println()
 
 	// Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
@@ -118,6 +120,14 @@ func main() {
 	<-sigCh
 
 	logging.Info("Shutting down...")
+
+	// Stop HTTP server first
+	logging.Info("Stopping HTTP server...")
+	if err := server.Stop(); err != nil {
+		logging.ErrLog("HTTP server shutdown error", logging.Err(err))
+	}
+
+	// Then stop scheduler
 	cancel()
 	sched.Stop()
 	logging.Info("Shutdown complete")

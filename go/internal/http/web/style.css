@@ -525,25 +525,29 @@ main {
     transform: rotate(3deg);
 }
 
-/* Responsive - 7 columns need smaller grid */
+/* Responsive - grid layout adjustments */
+/* Extra large screens: 8 columns */
 @media (min-width: 1601px) {
     .board {
         grid-template-columns: repeat(8, 1fr);
     }
 }
 
-@media (max-width: 1400px) and (min-width: 901px) {
+/* Large screens: 4 columns */
+@media (min-width: 901px) and (max-width: 1600px) {
     .board {
         grid-template-columns: repeat(4, 1fr);
     }
 }
 
-@media (max-width: 900px) and (min-width: 601px) {
+/* Medium screens: 2 columns */
+@media (min-width: 601px) and (max-width: 900px) {
     .board {
         grid-template-columns: repeat(2, 1fr);
     }
 }
 
+/* Small screens: 1 column */
 @media (max-width: 600px) {
     .board {
         grid-template-columns: 1fr;
@@ -571,4 +575,16 @@ main {
 .task-pr {
     color: #586069;
     font-weight: 500;
+}
+
+.task-error {
+    margin-top: 0.5rem;
+    padding: 0.5rem;
+    background: #fff5f5;
+    border: 1px solid #fed7d7;
+    border-radius: 6px;
+    color: #c53030;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    word-break: break-word;
 }

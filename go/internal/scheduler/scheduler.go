@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -221,45 +222,24 @@ func (s *Scheduler) handleRunningTask(ctx context.Context, task *store.Task) {
 		if task.AgentPID > 0 {
 			// Verify if the process exists
 			if processExists(task.AgentPID) {
-				// Process is running but not in our map - likely a server restart
-				// Try to track it by loading agent info from workspace
-				logging.Info("Found running agent after restart, re-tracking",
+				// Process is running but not in our map
+				// This could be:
+				// 1. Server restart (shouldn't happen with current code)
+				// 2. User manually dragged task to running (most likely)
+				// Either way, we can't re-connect to the existing process
+				// Kill it and mark as failed so user can retry properly
+
+				logging.Warn("Found running agent process not in scheduler map (possibly manually dragged to running). Killing process and marking as failed",
 					logging.String("task_id", task.ID),
 					logging.Int("pid", task.AgentPID))
-				
-				// Create a RunningTask entry for the existing process
-				ag, err := factory.NewAgent(s.cfg.Agent.Kind, s.cfg.Agent.Command, s.cfg.Agent.Args, task.Workspace)
-				if err != nil {
-					logging.ErrLog("Failed to create agent reference", logging.Err(err))
-					return
-				}
-				
-				var startTime time.Time
-				if task.StartedAt != nil {
-					startTime = *task.StartedAt
-				} else {
-					startTime = time.Now()
-				}
-				
-				rt := &RunningTask{
-					Task:      task,
-					Agent:     ag,
-					CancelFunc: func() {
-						// Cancel will be called via syscall kill when needed
-						if task.AgentPID > 0 {
-							syscall.Kill(task.AgentPID, syscall.SIGTERM)
-						}
-					},
-					StartTime: startTime,
-				}
-				
-				s.mu.Lock()
-				s.running[task.ID] = rt
-				s.mu.Unlock()
-				
-				logging.Info("Re-tracked running task",
-					logging.String("task_id", task.ID),
-					logging.Int("pid", task.AgentPID))
+
+				// Kill the orphaned process
+				syscall.Kill(-task.AgentPID, syscall.SIGTERM)
+				store.SetTaskPID(s.db, task.ID, 0)
+
+				// Mark as failed with clear message
+				store.UpdateTaskState(s.db, task.ID, store.StateFailed,
+					"Task was manually moved to running. Please use the retry button to start the task properly.")
 				return
 			}
 		}
@@ -268,6 +248,16 @@ func (s *Scheduler) handleRunningTask(ctx context.Context, task *store.Task) {
 		logging.Warn("Found orphaned running task, marking as failed",
 			logging.String("task_id", task.ID),
 			logging.Int("agent_pid", task.AgentPID))
+
+		// Kill the orphaned agent process if it's still running
+		if task.AgentPID > 0 && processExists(task.AgentPID) {
+			logging.Warn("Killing orphaned agent process",
+				logging.String("task_id", task.ID),
+				logging.Int("pid", task.AgentPID))
+			syscall.Kill(-task.AgentPID, syscall.SIGTERM)
+			store.SetTaskPID(s.db, task.ID, 0)
+		}
+
 		store.UpdateTaskState(s.db, task.ID, store.StateFailed, "Orphaned task: not found in scheduler")
 		return
 	}
@@ -289,6 +279,16 @@ func (s *Scheduler) handleDoneTask(ctx context.Context, task *store.Task) {
 	// Skip if no workspace (already archived or never had one)
 	if task.Workspace == "" {
 		return
+	}
+
+	// Check if workspace directory still exists
+	if _, err := os.Stat(task.Workspace); os.IsNotExist(err) {
+		// Workspace was cleaned up, but we still need to check PR status
+		logging.Info("Workspace no longer exists, but will check PR status",
+			logging.String("task_id", task.ID),
+			logging.String("workspace", task.Workspace))
+		// Clear the workspace field since it's gone
+		store.SetTaskWorkspace(s.db, task.ID, "")
 	}
 
 	// Fetch and save PR info if not already saved
@@ -313,20 +313,37 @@ func (s *Scheduler) handleDoneTask(ctx context.Context, task *store.Task) {
 		}
 	}
 
-	// Check if PR has been merged
-	merged, err := s.checkPRMerged(task)
+	// Check if PR has been merged or closed
+	closed, reason, err := s.checkPRClosed(task)
 	if err != nil {
-		logging.Debug("Failed to check PR merge status",
+		logging.Debug("Failed to check PR status",
 			logging.String("task_id", task.ID),
 			logging.Err(err))
 		return
 	}
 
-	if merged {
-		logging.Info("PR merged, moving task to archive",
+	if closed {
+		logging.Info("PR "+reason+", moving task to archive",
 			logging.String("task_id", task.ID))
 		// Transition to archive state
-		store.UpdateTaskState(s.db, task.ID, store.StateArchive, "PR merged")
+		store.UpdateTaskState(s.db, task.ID, store.StateArchive, reason)
+		return
+	}
+
+	// Check if there are new human comments on the PR
+	hasNewComments, err := s.checkForNewComments(task)
+	if err != nil {
+		logging.Debug("Failed to check PR comments",
+			logging.String("task_id", task.ID),
+			logging.Err(err))
+		return
+	}
+
+	if hasNewComments {
+		logging.Info("New comments detected on PR, moving to address-comment state",
+			logging.String("task_id", task.ID))
+		// Transition to address-comment state to handle the feedback
+		store.UpdateTaskState(s.db, task.ID, store.StateAddressComment, "New comments on PR")
 	}
 }
 
@@ -398,31 +415,155 @@ func (s *Scheduler) handleArchiveTask(ctx context.Context, task *store.Task) {
 	}
 }
 
-// checkPRMerged checks if the PR for a task has been merged.
-func (s *Scheduler) checkPRMerged(task *store.Task) (bool, error) {
-	if task.Workspace == "" {
-		return false, fmt.Errorf("no workspace")
-	}
-
-	// Run gh pr view to check PR status
+// checkPRClosed checks if the PR for a task has been merged or closed.
+func (s *Scheduler) checkPRClosed(task *store.Task) (bool, string, error) {
+	// Run gh pr view to check PR status (both merged and closed)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "gh", "pr", "view", "--json", "mergedAt", "--jq", ".mergedAt")
-	cmd.Dir = task.Workspace
+	// Use -R flag to specify repo, so we don't need to be in a specific directory
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", strconv.Itoa(task.PRNumber),
+		"-R", "tiancaiamao/ai", // TODO: make this configurable
+		"--json", "state,mergedAt,closedAt",
+		"--jq", "{state: .state, mergedAt: .mergedAt, closedAt: .closedAt}")
+
+	// Set working directory to workspace if it exists
+	if task.Workspace != "" {
+		if _, err := os.Stat(task.Workspace); err == nil {
+			cmd.Dir = task.Workspace
+		}
+	}
 
 	output, err := cmd.Output()
 	if err != nil {
 		// If no PR exists, return false
-		if strings.Contains(err.Error(), "no pull requests") {
-			return false, nil
+		if strings.Contains(err.Error(), "no pull requests") || strings.Contains(err.Error(), "not found") {
+			return false, "", nil
 		}
-		return false, fmt.Errorf("gh pr view: %w", err)
+		return false, "", fmt.Errorf("gh pr view: %w", err)
 	}
 
-	// If mergedAt is not null, PR is merged
-	mergedAt := strings.TrimSpace(string(output))
-	return mergedAt != "" && mergedAt != "null", nil
+	// Parse JSON response
+	var result struct {
+		State    string `json:"state"`
+		MergedAt string `json:"mergedAt"`
+		ClosedAt string `json:"closedAt"`
+	}
+
+	if err := json.Unmarshal(output, &result); err != nil {
+		return false, "", fmt.Errorf("parse PR status: %w", err)
+	}
+
+	// Check if PR is merged or closed
+	if result.State == "MERGED" || result.MergedAt != "" && result.MergedAt != "null" {
+		return true, "PR merged", nil
+	}
+
+	if result.State == "CLOSED" || result.ClosedAt != "" && result.ClosedAt != "null" {
+		return true, "PR closed", nil
+	}
+
+	return false, "", nil
+}
+
+// checkForNewComments checks if there are new comments on the PR since the task completed.
+func (s *Scheduler) checkForNewComments(task *store.Task) (bool, error) {
+	if task.PRNumber == 0 {
+		return false, nil
+	}
+
+	// Run gh pr view to get comments
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Use -R flag to specify repo, so we don't need to be in a specific directory
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", strconv.Itoa(task.PRNumber),
+		"-R", "tiancaiamao/ai", // TODO: make this configurable
+		"--json", "comments",
+		"--jq", ".comments[] | [.createdAt, .author.login, .body] | @json")
+
+	// Set working directory to workspace if it exists
+	if task.Workspace != "" {
+		if _, err := os.Stat(task.Workspace); err == nil {
+			cmd.Dir = task.Workspace
+		}
+	}
+
+	output, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("gh pr view comments: %w", err)
+	}
+
+	// Parse the output - each line is a JSON array: [createdAt, authorLogin, body]
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+
+	// Get the completion time as a reference point
+	var completionTime time.Time
+	if task.CompletedAt != nil && !task.CompletedAt.IsZero() {
+		completionTime = *task.CompletedAt
+	} else {
+		// If no completion time, use updated_at
+		completionTime = task.UpdatedAt
+	}
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "null" {
+			continue
+		}
+
+		// Parse JSON array
+		var commentData []json.RawMessage
+		if err := json.Unmarshal([]byte(line), &commentData); err != nil {
+			continue
+		}
+
+		if len(commentData) < 3 {
+			continue
+		}
+
+		// Extract timestamp
+		var createdAtStr string
+		if err := json.Unmarshal(commentData[0], &createdAtStr); err != nil {
+			continue
+		}
+
+		// Parse timestamp
+		createdAt, err := time.Parse(time.RFC3339, createdAtStr)
+		if err != nil {
+			continue
+		}
+
+		// Skip comments created before or at completion time
+		if !createdAt.After(completionTime) {
+			continue
+		}
+
+		// Extract author to filter out bot comments
+		var authorLogin string
+		if err := json.Unmarshal(commentData[1], &authorLogin); err != nil {
+			continue
+		}
+
+		// Skip bot comments (common bot names)
+		isBot := strings.Contains(authorLogin, "bot") ||
+			strings.Contains(authorLogin, "Bot") ||
+			authorLogin == "github-actions[bot]" ||
+			authorLogin == "dependabot[bot]"
+
+		if isBot {
+			continue
+		}
+
+		// Found a new human comment!
+		logging.Info("Found new comment on PR",
+			logging.String("task_id", task.ID),
+			logging.String("author", authorLogin))
+
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // processRetries checks for tasks ready to be retried.
@@ -462,19 +603,30 @@ func (s *Scheduler) processRetries(ctx context.Context) {
 		}
 		task.RetryCount = newCount
 
-		// Transition back to running
-		if err := store.UpdateTaskState(s.db, task.ID, store.StateRunning, ""); err != nil {
-			logging.ErrLog("Failed to transition task for retry", logging.Err(err))
-			continue
-		}
-
-		// Start the task
+		// Start the task - startTask will handle the state transition to running
+		// This prevents race condition where handleRunningTask sees running in DB
+		// but task not yet in s.running map
 		s.startTask(ctx, task)
 	}
 }
 
 // startTask begins execution of a task.
 func (s *Scheduler) startTask(ctx context.Context, task *store.Task) {
+	// IMPORTANT: First, kill any old agent process that might still be running
+	// This can happen after server restart or crash
+	if task.AgentPID > 0 {
+		if processExists(task.AgentPID) {
+			logging.Warn("Killing old agent process before starting new one",
+				logging.String("task_id", task.ID),
+				logging.Int("old_pid", task.AgentPID))
+			// Kill the entire process group
+			syscall.Kill(-task.AgentPID, syscall.SIGTERM)
+			time.Sleep(100 * time.Millisecond) // Give it time to terminate
+		}
+		// Clear the PID in database
+		store.SetTaskPID(s.db, task.ID, 0)
+	}
+
 	// Create workspace - only clean it for new tasks (todo state)
 	// For self-review and address-comment, preserve the existing workspace
 	if err := s.workspace.EnsureRoot(); err != nil {
@@ -542,13 +694,6 @@ func (s *Scheduler) startTask(ctx context.Context, task *store.Task) {
 		}
 	}
 
-	// Update task state and workspace
-	if err := store.UpdateTaskState(s.db, task.ID, store.StateRunning, ""); err != nil {
-		logging.ErrLog("Failed to transition task to running", logging.Err(err))
-		return
-	}
-	store.SetTaskWorkspace(s.db, task.ID, wsPath)
-
 	logging.Info("Starting task",
 		logging.String("task_id", task.ID),
 		logging.String("title", task.Title),
@@ -573,20 +718,23 @@ func (s *Scheduler) startTask(ctx context.Context, task *store.Task) {
 		StartTime:  time.Now(),
 	}
 
-	// Update task state and workspace BEFORE adding to running map
-	// This ensures handleRunningTask will find the task in the map after state transition
+	// IMPORTANT: Add to running map BEFORE updating database state
+	// This prevents race condition where handleRunningTask sees running in DB but not in map
+	s.mu.Lock()
+	s.running[task.ID] = rt
+	s.mu.Unlock()
+
+	// Now update database state - after task is in running map
 	if err := store.UpdateTaskState(s.db, task.ID, store.StateRunning, ""); err != nil {
 		logging.ErrLog("Failed to transition task to running", logging.Err(err))
+		// Remove from running map since we failed to update DB
+		s.mu.Lock()
+		delete(s.running, task.ID)
+		s.mu.Unlock()
 		cancel()
 		return
 	}
 	store.SetTaskWorkspace(s.db, task.ID, wsPath)
-
-	// Add to running map BEFORE starting goroutine
-	// This prevents race condition where handleRunningTask checks the map before goroutine starts
-	s.mu.Lock()
-	s.running[task.ID] = rt
-	s.mu.Unlock()
 
 	// Start task in goroutine
 	s.wg.Add(1)
@@ -605,6 +753,8 @@ func (s *Scheduler) startTask(ctx context.Context, task *store.Task) {
 
 // runTask executes the agent for a task.
 func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Task, wsPath string) {
+	logging.Info("runTask: Starting agent", logging.String("task_id", task.ID))
+
 	// Start agent session
 	if err := rt.Agent.StartSession(ctx, agent.SessionConfig{
 		Workspace: wsPath,
@@ -615,6 +765,8 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 		s.handleTaskFailure(task, err)
 		return
 	}
+
+	logging.Info("runTask: Agent session started", logging.String("task_id", task.ID))
 
 	// Set agent PID if available
 	// This allows us to track the process after server restart
@@ -632,6 +784,7 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 
 	// Build prompt from WORKFLOW.md
 	prompt := s.buildPrompt(task)
+	logging.Info("runTask: Sending prompt", logging.String("task_id", task.ID))
 
 	if err := rt.Agent.SendPrompt(ctx, prompt); err != nil {
 		logging.ErrLog("Failed to send prompt", logging.String("task_id", task.ID), logging.Err(err))
@@ -639,24 +792,60 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 		return
 	}
 
+	logging.Info("runTask: Waiting for events", logging.String("task_id", task.ID))
+
 	// Wait for completion
+	eventCount := 0
 	for event := range rt.Agent.Events() {
+		eventCount++
+		logging.Info("runTask: Received event",
+			logging.String("task_id", task.ID),
+			logging.String("event_type", event.Type),
+			logging.Int("event_count", eventCount))
+
 		switch event.Type {
 		case agent.EventAgentEnd:
-			logging.Info("Task completed successfully", logging.String("task_id", task.ID))
+			// Reload task from database to get latest state (PRNumber, etc.)
+			// The task object passed to runTask is stale - it doesn't reflect
+			// updates made during agent execution (like PR creation)
+			latestTask, err := store.GetTask(s.db, task.ID)
+			if err != nil {
+				logging.ErrLog("Failed to reload task", logging.String("task_id", task.ID), logging.Err(err))
+				// Fall back to using stale task object
+				latestTask = task
+			}
 
-			// Remove from running map BEFORE updating database to prevent orphaned task race
-			s.mu.Lock()
-			delete(s.running, task.ID)
-			s.mu.Unlock()
+			// Verify that the task actually completed successfully
+			// Check if task has PR (for non-review tasks) or other completion indicators
+			completedSuccessfully := s.verifyTaskCompletion(latestTask)
 
-			// Transition based on current state:
-			// - Self review tasks complete directly to Done
-			// - Other tasks transition to Self Review
-			if task.State == store.StateSelfReview || task.State == store.StateAddressComment {
-				store.UpdateTaskState(s.db, task.ID, store.StateDone, "")
+			if completedSuccessfully {
+				logging.Info("Task completed successfully", logging.String("task_id", task.ID))
+
+				// Remove from running map BEFORE updating database to prevent orphaned task race
+				s.mu.Lock()
+				delete(s.running, task.ID)
+				s.mu.Unlock()
+
+				// Transition based on latest task state:
+				// - Self review tasks complete directly to Done
+				// - Other tasks transition to Self Review
+				if latestTask.State == store.StateSelfReview || latestTask.State == store.StateAddressComment {
+					store.UpdateTaskState(s.db, task.ID, store.StateDone, "")
+				} else {
+					store.UpdateTaskState(s.db, task.ID, store.StateSelfReview, "")
+				}
 			} else {
-				store.UpdateTaskState(s.db, task.ID, store.StateSelfReview, "")
+				// Task didn't complete properly - mark as failed
+				logging.Warn("Task ended without completion (no PR or commits), marking as failed",
+					logging.String("task_id", task.ID),
+					logging.String("state", string(task.State)))
+
+				s.mu.Lock()
+				delete(s.running, task.ID)
+				s.mu.Unlock()
+
+				s.handleTaskFailure(task, fmt.Errorf("agent ended without creating PR or completing required work"))
 			}
 			return
 
@@ -677,9 +866,34 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 		}
 	}
 
+	logging.Warn("runTask: Events channel closed without completion event",
+		logging.String("task_id", task.ID),
+		logging.Int("total_events", eventCount))
+
 	// Agent closed without explicit end - assume success
 	logging.Info("Agent finished", logging.String("task_id", task.ID))
 	store.UpdateTaskState(s.db, task.ID, store.StateDone, "")
+}
+
+// verifyTaskCompletion checks if a task has actually completed successfully.
+// Returns true if:
+// - Task is in SelfReview/AddressComment state (PR already exists)
+// - Task has a PR number (PR was created)
+// Returns false if:
+// - Task is in Running/Todo state but has no PR
+func (s *Scheduler) verifyTaskCompletion(task *store.Task) bool {
+	// Tasks in review states are considered complete (PR already exists)
+	if task.State == store.StateSelfReview || task.State == store.StateAddressComment {
+		return true
+	}
+
+	// Check if PR was created
+	if task.PRNumber > 0 {
+		return true
+	}
+
+	// Task ended without creating PR - not completed
+	return false
 }
 
 // handleTaskFailure handles a task failure with retry logic.
@@ -690,7 +904,7 @@ func (s *Scheduler) handleTaskFailure(task *store.Task, err error) {
 	}
 
 	// Check if we can retry
-	if task.RetryCount < 3 { // TODO: use config
+	if task.RetryCount < s.cfg.Agent.MaxRetries {
 		// Mark as failed and schedule retry
 		store.UpdateTaskState(s.db, task.ID, store.StateFailed, errMsg)
 
@@ -809,49 +1023,24 @@ Work in the provided workspace. Complete the task and report your results.`, tas
 func (s *Scheduler) replaceTemplateVars(content string, task *store.Task) string {
 	// Simple variable replacement (can be enhanced with proper templating)
 	replacements := map[string]string{
-		"{{ task.id }}":          task.ID,
-		"{{ task.title }}":       task.Title,
+		"{{ task.id }}":     task.ID,
+		"{{ task.title }}":  task.Title,
 		"{{ task.description }}": task.Description,
-		"{{ task.state }}":       string(task.State),
-		"{{ task.labels }}":      "",
-		"{{ task.url }}":         fmt.Sprintf("http://localhost:8080/tasks/%s", task.ID),
-		"{{.TaskID }}":          task.ID,
-		"{{.TaskTitle }}":       task.Title,
-		"{{.Repo }}":            "your-org/your-repo", // TODO: from config
-		"{{.Workspace }}":       task.Workspace,
+		"{{ task.state }}":  string(task.State),
+		"{{ task.labels }}": "",
+		"{{ task.url }}":    fmt.Sprintf("http://localhost:8080/tasks/%s", task.ID),
+		"{{.TaskID }}":      task.ID,
+		"{{.TaskTitle }}":   task.Title,
+		"{{.Repo }}":        "your-org/your-repo", // TODO: from config
+		"{{.Workspace }}":   task.Workspace,
 	}
 
 	result := content
 	for placeholder, value := range replacements {
-		result = replaceAll(result, placeholder, value)
+		result = strings.ReplaceAll(result, placeholder, value)
 	}
 
 	return result
-}
-
-// replaceAll is a helper to replace all occurrences
-func replaceAll(s, old, new string) string {
-	// Simple implementation - can use strings.ReplaceAll
-	result := ""
-	for {
-		idx := findSubstring(s, old)
-		if idx == -1 {
-			break
-		}
-		result += s[:idx] + new
-		s = s[idx+len(old):]
-	}
-	return result + s
-}
-
-// findSubstring finds the index of a substring
-func findSubstring(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
 }
 // getPRInfo fetches PR information for a task.
 func (s *Scheduler) getPRInfo(task *store.Task) (prNumber int, prURL string, err error) {

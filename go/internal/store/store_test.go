@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"os"
 	"testing"
 	"time"
@@ -289,7 +290,7 @@ func TestIncrementRetryCount(t *testing.T) {
 	}
 }
 
-func setupTestDB(t *testing.T) *DB {
+func setupTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 
 	tmpFile, err := os.CreateTemp("", "symphony-test-*.db")
@@ -308,9 +309,3 @@ func setupTestDB(t *testing.T) *DB {
 
 	return db
 }
-
-type DB = struct {
-	*sql.DB
-}
-
-import "database/sql"

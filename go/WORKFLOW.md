@@ -203,10 +203,10 @@ The agent should be able to talk to GitHub via `gh` CLI. If `gh` is not availabl
    gh pr close --comment "Reworking with fresh approach"
    ```
 4. Remove the existing `WORKPAD.md` file.
-5. Create a fresh branch from `origin/main`:
+5. Reset the current workspace to `origin/main`:
    ```bash
-   git checkout main
-   git pull origin main
+   git fetch origin main
+   git reset --hard origin/main
    git checkout -b {{ task.id }}-v2
    ```
 6. Start over from the normal kickoff flow:

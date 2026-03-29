@@ -59,6 +59,7 @@ type AgentConfig struct {
 	MaxConcurrentAgents  int
 	MaxTurns            int
 	MaxRetryBackoffMs   int
+	MaxRetries          int
 }
 
 // ServerConfig holds HTTP server settings.
@@ -95,6 +96,7 @@ func Load(workflowCfg map[string]interface{}) (*Config, error) {
 			MaxConcurrentAgents: getInt(workflowCfg, "agent", "max_concurrent_agents", 10),
 			MaxTurns:           getInt(workflowCfg, "agent", "max_turns", 20),
 			MaxRetryBackoffMs:  getInt(workflowCfg, "agent", "max_retry_backoff_ms", 300000),
+			MaxRetries:         getInt(workflowCfg, "agent", "max_retries", 3),
 		},
 		Server: ServerConfig{
 			Port: getInt(workflowCfg, "server", "port", 8080),

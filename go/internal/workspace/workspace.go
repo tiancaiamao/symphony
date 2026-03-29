@@ -87,11 +87,18 @@ func (m *Manager) RunHook(hookScript, workspace, issueID, identifier string) err
 		result = strings.ReplaceAll(result, placeholder, value)
 	}
 
+	// Log hook execution for debugging
+	fmt.Printf("[HOOK] Executing: %s\n", result)
+	fmt.Printf("[HOOK] Workspace: %s, IssueID: %s\n", workspace, issueID)
+
 	ctx, cancel := context.WithTimeout(context.Background(), m.hookTimeout)
 	defer cancel()
 
+	// Run from home directory instead of workspace to avoid issues with empty workspace
+	home, _ := os.UserHomeDir()
+
 	cmd := exec.CommandContext(ctx, "sh", "-c", result)
-	cmd.Dir = workspace
+	cmd.Dir = home  // Run from home directory, not workspace
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -103,7 +110,13 @@ func (m *Manager) RunHook(hookScript, workspace, issueID, identifier string) err
 	)
 	cmd.Env = env
 
-	return cmd.Run()
+	err := cmd.Run()
+	if err != nil {
+		fmt.Printf("[HOOK] Failed: %v\n", err)
+	} else {
+		fmt.Printf("[HOOK] Success\n")
+	}
+	return err
 }
 
 // EnsureRoot ensures the workspace root exists.

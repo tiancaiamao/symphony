@@ -190,14 +190,14 @@ func ListTasksByState(db *sql.DB, state string) ([]Task, error) {
 	for rows.Next() {
 		task := Task{}
 		var startedAt, completedAt sql.NullTime
-		var workspace, lastError sql.NullString
-		var agentPID sql.NullInt64
+		var workspace, lastError, prURL, prState sql.NullString
+		var agentPID, prNumber sql.NullInt64
 
 		err := rows.Scan(
 			&task.ID, &task.Title, &task.Description, &task.State,
 			&task.CreatedAt, &task.UpdatedAt,
 			&workspace, &agentPID, &task.RetryCount, &lastError,
-			&startedAt, &completedAt,
+			&startedAt, &completedAt, &prNumber, &prURL, &prState,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan task: %w", err)
@@ -206,6 +206,9 @@ func ListTasksByState(db *sql.DB, state string) ([]Task, error) {
 		task.Workspace = workspace.String
 		task.AgentPID = int(agentPID.Int64)
 		task.LastError = lastError.String
+		task.PRNumber = int(prNumber.Int64)
+		task.PRURL = prURL.String
+		task.PRState = prState.String
 		if startedAt.Valid {
 			task.StartedAt = &startedAt.Time
 		}
