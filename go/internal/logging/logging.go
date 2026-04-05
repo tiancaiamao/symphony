@@ -45,6 +45,9 @@ func String(key, value string) slog.Attr {
 
 // Err returns a slog.Attr for an error value.
 func Err(err error) slog.Attr {
+	if err == nil {
+		return slog.String("error", "<nil>")
+	}
 	return slog.String("error", err.Error())
 }
 

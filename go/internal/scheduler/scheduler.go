@@ -179,6 +179,10 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 			s.handleTodoTask(ctx, task)
 		case store.StateRunning:
 			s.handleRunningTask(ctx, task)
+		case store.StateRunningReview:
+			s.handleRunningTask(ctx, task)
+		case store.StateRunningAddressComment:
+			s.handleRunningTask(ctx, task)
 		case store.StateSelfReview:
 			s.handleSelfReviewTask(ctx, task)
 		case store.StateAddressComment:
@@ -221,6 +225,9 @@ func (s *Scheduler) handleRunningTask(ctx context.Context, task *store.Task) {
 		// Check if the agent process is actually running
 		if task.AgentPID > 0 {
 			// Verify if the process exists
+			logging.Debug("Task not in running map, checking if process exists",
+				logging.String("task_id", task.ID),
+				logging.Int("pid", task.AgentPID))
 			if processExists(task.AgentPID) {
 				// Process is running but not in our map
 				// This could be:
@@ -394,9 +401,25 @@ func (s *Scheduler) handleArchiveTask(ctx context.Context, task *store.Task) {
 		return
 	}
 
-	// Remove workspace directory
+	// First, run before_remove hook to clean up git worktree
+	// This ensures git worktree metadata is properly removed before deleting the directory
+	if s.cfg.Hooks.BeforeRemove != "" {
+		if err := s.workspace.RunHook(s.cfg.Hooks.BeforeRemove, task.Workspace, task.ID, task.ID); err != nil {
+			logging.Warn("Failed to run before_remove hook for archive cleanup",
+				logging.String("task_id", task.ID),
+				logging.String("workspace", task.Workspace),
+				logging.Err(err))
+			// Continue anyway - the hook has fallback error handling
+		} else {
+			logging.Info("Git worktree removed via before_remove hook",
+				logging.String("task_id", task.ID),
+				logging.String("workspace", task.Workspace))
+		}
+	}
+
+	// Then remove workspace directory
 	if err := s.workspace.Remove(task.Workspace); err != nil {
-		logging.ErrLog("Failed to cleanup workspace",
+		logging.ErrLog("Failed to cleanup workspace directory",
 			logging.String("task_id", task.ID),
 			logging.String("workspace", task.Workspace),
 			logging.Err(err))
@@ -504,6 +527,17 @@ func (s *Scheduler) checkForNewComments(task *store.Task) (bool, error) {
 	} else {
 		// If no completion time, use updated_at
 		completionTime = task.UpdatedAt
+	}
+
+	// Fix timezone issue: Manual database updates store timestamps without timezone info,
+	// and Go's sqlite driver reads them as UTC. But they were written as local time.
+	// We detect this by checking if the timezone is UTC but the time looks suspicious.
+	// Solution: Convert what looks like local-time-stored-as-UTC back to proper UTC.
+	if completionTime.Location() == time.UTC {
+		// This was likely a local time stored without timezone info
+		// Convert it to proper UTC by subtracting the local timezone offset
+		_, offset := time.Now().Zone()
+		completionTime = completionTime.Add(-time.Duration(offset) * time.Second)
 	}
 
 	for _, line := range lines {
@@ -724,8 +758,18 @@ func (s *Scheduler) startTask(ctx context.Context, task *store.Task) {
 	s.running[task.ID] = rt
 	s.mu.Unlock()
 
+	// Determine the target running state based on the original task state
+	// This allows UI to distinguish between different types of running tasks
+	targetRunningState := store.StateRunning
+	switch task.State {
+	case store.StateSelfReview:
+		targetRunningState = store.StateRunningReview
+	case store.StateAddressComment:
+		targetRunningState = store.StateRunningAddressComment
+	}
+
 	// Now update database state - after task is in running map
-	if err := store.UpdateTaskState(s.db, task.ID, store.StateRunning, ""); err != nil {
+	if err := store.UpdateTaskState(s.db, task.ID, targetRunningState, ""); err != nil {
 		logging.ErrLog("Failed to transition task to running", logging.Err(err))
 		// Remove from running map since we failed to update DB
 		s.mu.Lock()
@@ -822,30 +866,33 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 			if completedSuccessfully {
 				logging.Info("Task completed successfully", logging.String("task_id", task.ID))
 
-				// Remove from running map BEFORE updating database to prevent orphaned task race
+				// Update database state BEFORE removing from running map.
+				// This prevents the race where reconcile's handleRunningTask sees
+				// RunningReview state, task not in s.running, and marks it orphaned.
+				if latestTask.State == store.StateSelfReview || latestTask.State == store.StateAddressComment ||
+					latestTask.State == store.StateRunningReview || latestTask.State == store.StateRunningAddressComment {
+					// Review tasks are done - move to Done state
+					store.UpdateTaskState(s.db, task.ID, store.StateDone, "")
+				} else {
+					// Other tasks move to Self Review
+					store.UpdateTaskState(s.db, task.ID, store.StateSelfReview, "")
+				}
+
+				// Now safe to remove from running map
 				s.mu.Lock()
 				delete(s.running, task.ID)
 				s.mu.Unlock()
-
-				// Transition based on latest task state:
-				// - Self review tasks complete directly to Done
-				// - Other tasks transition to Self Review
-				if latestTask.State == store.StateSelfReview || latestTask.State == store.StateAddressComment {
-					store.UpdateTaskState(s.db, task.ID, store.StateDone, "")
-				} else {
-					store.UpdateTaskState(s.db, task.ID, store.StateSelfReview, "")
-				}
 			} else {
 				// Task didn't complete properly - mark as failed
 				logging.Warn("Task ended without completion (no PR or commits), marking as failed",
 					logging.String("task_id", task.ID),
 					logging.String("state", string(task.State)))
 
+				s.handleTaskFailure(task, fmt.Errorf("agent ended without creating PR or completing required work"))
+
 				s.mu.Lock()
 				delete(s.running, task.ID)
 				s.mu.Unlock()
-
-				s.handleTaskFailure(task, fmt.Errorf("agent ended without creating PR or completing required work"))
 			}
 			return
 
@@ -856,12 +903,13 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 			}
 			logging.ErrLog("Task failed with error", logging.String("task_id", task.ID), logging.String("error", errMsg))
 
-			// Remove from running map BEFORE updating database to prevent orphaned task race
+			// Update database state BEFORE removing from running map
+			// to prevent reconcile from seeing orphaned task.
+			s.handleTaskFailure(task, fmt.Errorf("%s", errMsg))
+
 			s.mu.Lock()
 			delete(s.running, task.ID)
 			s.mu.Unlock()
-
-			s.handleTaskFailure(task, fmt.Errorf("%s", errMsg))
 			return
 		}
 	}
@@ -873,26 +921,57 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 	// Agent closed without explicit end - assume success
 	logging.Info("Agent finished", logging.String("task_id", task.ID))
 	store.UpdateTaskState(s.db, task.ID, store.StateDone, "")
+
+	// Remove from running map after state update to prevent race
+	s.mu.Lock()
+	delete(s.running, task.ID)
+	s.mu.Unlock()
 }
 
 // verifyTaskCompletion checks if a task has actually completed successfully.
 // Returns true if:
-// - Task is in SelfReview/AddressComment state (PR already exists)
-// - Task has a PR number (PR was created)
+// - Task is in SelfReview/AddressComment/RunningReview/RunningAddressComment state (PR already exists)
+// - Task has a PR number recorded (PR was created during this run)
+// - A PR exists on GitHub for the task branch (created by agent)
+// - Agent made commits on the task branch that differ from origin/main
 // Returns false if:
-// - Task is in Running/Todo state but has no PR
+// - Task is in Running/Todo state with no PR and no commits
 func (s *Scheduler) verifyTaskCompletion(task *store.Task) bool {
 	// Tasks in review states are considered complete (PR already exists)
-	if task.State == store.StateSelfReview || task.State == store.StateAddressComment {
+	if task.State == store.StateSelfReview || task.State == store.StateAddressComment ||
+		task.State == store.StateRunningReview || task.State == store.StateRunningAddressComment {
 		return true
 	}
 
-	// Check if PR was created
+	// Check if PR was recorded in DB during agent execution
 	if task.PRNumber > 0 {
 		return true
 	}
 
-	// Task ended without creating PR - not completed
+	// Check GitHub for a PR on the task branch (agent may have created one not yet recorded)
+	if prNumber, prURL, err := s.getPRInfo(task); err == nil && prNumber > 0 {
+		logging.Info("Found PR on GitHub for task branch",
+			logging.String("task_id", task.ID),
+			logging.Int("pr_number", prNumber),
+			logging.String("pr_url", prURL))
+		// Persist to DB so we don't need to re-query
+		store.SetTaskPR(s.db, task.ID, prNumber, prURL)
+		return true
+	}
+
+	// Check if agent made commits on the task branch (work was done but PR not created yet)
+	if task.Workspace != "" {
+		cmd := exec.Command("git", "log", "origin/main..HEAD", "--oneline")
+		cmd.Dir = task.Workspace
+		if output, err := cmd.Output(); err == nil && len(strings.TrimSpace(string(output))) > 0 {
+			logging.Info("Task has commits ahead of origin/main but no PR",
+				logging.String("task_id", task.ID),
+				logging.String("commits", strings.TrimSpace(string(output))))
+			return true
+		}
+	}
+
+	// Task ended without creating PR or making commits - not completed
 	return false
 }
 
@@ -984,15 +1063,12 @@ func (s *Scheduler) RetryTask(ctx context.Context, taskID string) error {
 func (s *Scheduler) buildPrompt(task *store.Task) string {
 	// Try to read WORKFLOW.md from the task's workspace
 	var workflowContent string
-	var err error
 
 	if task.Workspace != "" {
 		workflowPath := filepath.Join(task.Workspace, "WORKFLOW.md")
 		content, readErr := os.ReadFile(workflowPath)
 		if readErr == nil {
 			workflowContent = string(content)
-		} else {
-			err = readErr
 		}
 	}
 
@@ -1000,23 +1076,25 @@ func (s *Scheduler) buildPrompt(task *store.Task) string {
 		// Fallback to simple prompt if WORKFLOW.md not found
 		logging.Warn("WORKFLOW.md not found, using default prompt",
 			logging.String("task_id", task.ID),
-			logging.String("workspace", task.Workspace),
-			logging.Err(err))
+			logging.String("workspace", task.Workspace))
 
-		return fmt.Sprintf(`You are working on the following task:
+		// Build state-specific prompt
+		basePrompt := fmt.Sprintf(`You are working on the following task:
 
 Title: %s
 
 Description:
-%s
+%s`, task.Title, task.Description)
 
-Work in the provided workspace. Complete the task and report your results.`, task.Title, task.Description)
+		// Add state-specific instructions
+		return s.addStateSpecificInstructions(basePrompt, task)
 	}
 
 	// Replace template variables
 	prompt := s.replaceTemplateVars(workflowContent, task)
 
-	return prompt
+	// Add state-specific instructions (even when WORKFLOW.md exists)
+	return s.addStateSpecificInstructions(prompt, task)
 }
 
 // replaceTemplateVars replaces template variables in the workflow content
@@ -1041,6 +1119,150 @@ func (s *Scheduler) replaceTemplateVars(content string, task *store.Task) string
 	}
 
 	return result
+}
+
+// addStateSpecificInstructions adds state-specific instructions to the prompt
+func (s *Scheduler) addStateSpecificInstructions(prompt string, task *store.Task) string {
+	var instructions string
+
+	// Determine the original task state (strip running- prefix if present)
+	state := task.State
+	if strings.HasPrefix(state, "running-") {
+		state = strings.TrimPrefix(state, "running-")
+	}
+	// Replace hyphens with spaces for display in instructions
+	displayState := strings.ReplaceAll(state, "-", " ")
+
+	switch state {
+	case "self-review":
+		instructions = `
+
+## Current Status: Self Review
+
+A PR has been created for this task. Your job is to review it:
+
+1. Use the review skill to review your own PR:
+   /skill:review review PR #$(gh pr view --json number -q .number)
+
+2. Read the review result from the output file
+
+3. If there are P0 or P1 findings:
+   - Move task to address-comment: Update task state to "address-comment"
+   - Document findings in the workpad
+   - STOP and wait for next instruction
+
+4. If there are NO P0 or P1 findings:
+   - AI self-approve the PR:
+     gh pr review --approve --body "AI self-review passed. No P0/P1 findings. Ready for human merge."
+   - Poll for external feedback:
+     gh pr checks
+     gh pr view --comments
+   - If external feedback requires changes, move to "address-comment"
+   - If all checks pass and no actionable feedback:
+     - Move task to "done" state
+
+DO NOT make new code changes during self-review. Only review the existing PR.
+`
+
+	case "address-comment":
+		instructions = `
+
+## Current Status: Address Comment
+
+There are review comments or feedback on the PR that need to be addressed:
+
+1. Read the findings/comments from:
+   - The workpad
+   - PR review comments: gh pr view --comments
+   - Review output file
+
+2. Address each finding:
+   - Fix code issues
+   - Respond to comments with justification if pushing back
+   - Update tests if needed
+
+3. Commit and push changes:
+   git add -A
+   git commit -m "Address review comments"
+   git push origin <task-branch>
+
+4. Move task back to "self-review" for re-validation
+
+Focus only on addressing the feedback. Do not add new features or make unrelated changes.
+`
+
+	case "human-review":
+		instructions = `
+
+## Current Status: Human Review
+
+The PR has been approved by AI and is waiting for human review.
+
+DO NOT:
+- Make any code changes
+- Modify the task content
+- Push new commits
+
+DO:
+- Poll for updates as needed (PR comments, CI checks)
+- If review feedback requires changes, move task to "address-comment"
+- Wait for human to move task to "done" state
+
+The task is complete and waiting for human approval.
+`
+
+	case "merging":
+		instructions = `
+
+## Current Status: Merging
+
+The PR has been approved and should be merged.
+
+1. Run the land skill to merge the PR:
+   /land --pr-url $(gh pr view --json url -q .url)
+
+2. After merge is complete, move task to "done" state
+`
+
+	case "rework":
+		instructions = `
+
+## Current Status: Rework
+
+The human reviewer requested changes. You need to start over with a fresh approach.
+
+1. Close the existing PR:
+   gh pr close --comment "Reworking with fresh approach"
+
+2. Reset the workspace:
+   git fetch origin main
+   git reset --hard origin/main
+   git checkout -b <task-branch>-v2
+
+3. Start over from the beginning:
+   - Re-read the full task body
+   - Re-analyze the requirements
+   - Create a fresh implementation
+   - Create a new PR
+
+This is a complete restart, not incremental patching.
+`
+
+	case "done", "failed", "archive":
+		instructions = `
+
+## Current Status: Terminal State
+
+This task is in a terminal state (` + displayState + `). DO NOT make any changes.
+Stop and exit.
+`
+	}
+
+	if instructions != "" {
+		return prompt + instructions
+	}
+
+	return prompt
 }
 // getPRInfo fetches PR information for a task.
 func (s *Scheduler) getPRInfo(task *store.Task) (prNumber int, prURL string, err error) {

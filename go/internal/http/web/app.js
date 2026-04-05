@@ -99,7 +99,15 @@ function renderBoard(tasks) {
     };
 
     tasks.forEach(task => {
-        const state = task.state || 'inbox';
+        let state = task.state || 'inbox';
+
+        // Map running sub-states to their parent columns for display
+        if (state === 'running-review') {
+            state = 'self-review';
+        } else if (state === 'running-address-comment') {
+            state = 'address-comment';
+        }
+
         if (columns[state]) {
             columns[state].push(task);
         }

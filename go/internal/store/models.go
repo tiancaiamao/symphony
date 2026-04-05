@@ -5,14 +5,16 @@ import "time"
 
 // Task states.
 const (
-	StateInbox          = "inbox"
-	StateTodo           = "todo"
-	StateRunning        = "running"
-	StateSelfReview     = "self-review"
-	StateAddressComment = "address-comment"
-	StateDone           = "done"
-	StateArchive        = "archive"
-	StateFailed         = "failed"
+	StateInbox                 = "inbox"
+	StateTodo                  = "todo"
+	StateRunning               = "running"
+	StateRunningReview        = "running-review"
+	StateRunningAddressComment = "running-address-comment"
+	StateSelfReview            = "self-review"
+	StateAddressComment        = "address-comment"
+	StateDone                  = "done"
+	StateArchive               = "archive"
+	StateFailed                = "failed"
 )
 
 // Task represents a work item to be processed by an agent.

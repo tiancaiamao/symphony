@@ -102,7 +102,12 @@ func (a *AIAgent) StartSession(ctx context.Context, cfg agent.SessionConfig) err
 		return fmt.Errorf("start process: %w", err)
 	}
 
-	fmt.Printf("[AGENT] Started successfully (PID: %d)\n", a.cmd.Process.Pid)
+	pid := a.cmd.Process.Pid
+	fmt.Printf("[AGENT] Started successfully (PID: %d)\n", pid)
+
+	// Start a goroutine to monitor process exit
+	go a.monitorProcess()
+
 	go a.readStdout()
 	return nil
 }
@@ -186,5 +191,45 @@ func (a *AIAgent) readStderr(stderr io.Reader) {
 	}
 	if err := sc.Err(); err != nil {
 		fmt.Printf("[AGENT STDERR] Read error: %v\n", err)
+	}
+}
+
+// monitorProcess waits for the agent process to exit and logs the exit status
+func (a *AIAgent) monitorProcess() {
+	a.mu.Lock()
+	cmd := a.cmd
+	a.mu.Unlock()
+
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+
+	pid := cmd.Process.Pid
+	fmt.Printf("[AGENT MONITOR] Monitoring PID %d for exit\n", pid)
+
+	// Wait for the process to exit
+	err := cmd.Wait()
+
+	fmt.Printf("[AGENT MONITOR] PID %d exited with error: %v\n", pid, err)
+
+	if err != nil {
+		// Process exited with an error
+		fmt.Printf("[AGENT MONITOR] Exit error type: %T\n", err)
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			fmt.Printf("[AGENT MONITOR] Exit code: %d\n", exitErr.ExitCode())
+			fmt.Printf("[AGENT MONITOR] Stderr: %s\n", string(exitErr.Stderr))
+		}
+	}
+
+	// Send agent_end event if not already stopped
+	select {
+	case <-a.done:
+		fmt.Printf("[AGENT MONITOR] Agent already stopped\n")
+	default:
+		fmt.Printf("[AGENT MONITOR] Sending agent_end event due to process exit\n")
+		select {
+		case a.events <- agent.Event{Type: agent.EventAgentEnd, Data: nil}:
+		case <-a.done:
+		}
 	}
 }
