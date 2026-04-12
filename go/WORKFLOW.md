@@ -9,7 +9,7 @@ tracker:
     - Running
     - Self Review
     - Address Comment
-    - Human Review
+
     - Merging
     - Rework
   terminal_states:
@@ -69,7 +69,7 @@ Work only in the provided repository copy. Do not touch any other path.
 The Symphony orchestration server is available at `http://localhost:8081`. Use it to transition task states:
 
 ```bash
-# Move task to a new state (valid states: inbox, todo, running, self-review, address-comment, human-review, merging, rework, done)
+# Move task to a new state (valid states: inbox, todo, running, self-review, address-comment, done)
 curl -X PUT http://localhost:8081/api/tasks/{{ task.id }} \
   -H "Content-Type: application/json" \
   -d '{"state": "self-review"}'
@@ -107,12 +107,9 @@ For commit and push, use direct git commands (see Step 2).
 - `Todo` -> queued; immediately transition to `Running` before active work.
   - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Self Review`).
 - `Running` -> implementation actively underway.
-- `Self Review` -> AI reviews its own PR using the review skill.
+- `Self Review` -> AI reviews its own PR, leaves comment, moves to `Done` or `Address Comment`.
 - `Address Comment` -> AI addresses findings from self-review or external feedback.
-- `Human Review` -> PR is attached, validated, AI-approved; waiting on human merge.
-- `Merging` -> approved by human; execute the `land` skill flow.
-- `Rework` -> human reviewer requested changes; process feedback and re-submit.
-- `Done` -> terminal; work is complete.
+- `Done` -> PR reviewed and passed; scheduler monitors for merge or new comments.
 - `Failed` -> terminal; work failed after max retries.
 
 ## Step 1: Initial triage and kickoff
@@ -169,11 +166,11 @@ For commit and push, use direct git commands (see Step 2).
      ```
 3. Update task state via Symphony API:
    - Issues found → `"address-comment"`
-   - No issues → `"human-review"`
+   - No issues → `"done"`
    ```bash
    curl -X PUT http://localhost:8081/api/tasks/{{ task.id }} \
      -H "Content-Type: application/json" \
-     -d '{"state": "human-review"}'
+     -d '{"state": "done"}'
    ```
 4. STOP. Do NOT edit code, commit, or push during self-review.
 
@@ -194,19 +191,7 @@ NOTE: You cannot approve your own PR (GitHub restriction). A comment is sufficie
    ```
 4. Move task back to `Self Review` for re-validation.
 
-## Step 5: Human Review and merge handling
-
-1. When the task is in `Human Review`, do not code or change task content.
-2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
-3. If review feedback requires changes, move the task to `Rework` and follow the rework flow.
-4. If approved, human moves the task to `Merging`.
-5. When the task is in `Merging`, run the `land` skill:
-   ```bash
-   /land --pr-url $(gh pr view --json url -q .url)
-   ```
-6. After merge is complete, move the task to `Done`.
-
-## Step 6: Rework handling
+## Step 5: Done state monitoring
 
 1. Treat `Rework` as a full approach reset, not incremental patching.
 2. Re-read the full task body and all human comments; explicitly identify what will be done differently this attempt.
@@ -226,15 +211,12 @@ NOTE: You cannot approve your own PR (GitHub restriction). A comment is sufficie
    - Create a new `WORKPAD.md` file.
    - Build a fresh plan/checklist and execute end-to-end.
 
-## Completion bar before Human Review
+## Completion bar
 
 - Step 1/2 checklist is fully complete and accurately reflected in the single workpad file.
 - Acceptance criteria and required task-provided validation items are complete.
 - Validation/tests are green for the latest commit.
-- **AI self-review completed with no P0/P1 findings**.
-- **AI has approved the PR**.
-- External PR checks are green (CI, bots).
-- No actionable external comments remain.
+- **AI self-review completed with no P0/P1 findings, comment left on PR**.
 - PR is linked on the task with `symphony` label.
 
 ## Guardrails
@@ -244,8 +226,6 @@ NOTE: You cannot approve your own PR (GitHub restriction). A comment is sufficie
 - If task state is `Done` or `Closed`, do not modify it.
 - Do not edit the task description for planning or progress tracking.
 - Use exactly one persistent workpad file (WORKPAD.md) per task.
-- Do not move to `Human Review` unless the `Completion bar before Human Review` is satisfied.
-- In `Human Review`, do not make changes; wait and poll.
 - If state is terminal (`Done`, `Failed`), do nothing and shut down.
 - Keep task text concise, specific, and reviewer-oriented.
 - If blocked and no workpad exists yet, add one blocker note describing blocker, impact, and next unblock action.

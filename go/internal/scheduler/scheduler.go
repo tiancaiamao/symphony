@@ -1374,13 +1374,13 @@ Steps:
      ...
      Please address these before merge."
    - If there are NO P0/P1 findings:
-     gh pr comment <PR_NUMBER> --body "✅ **Review passed.** No P0/P1 findings. Ready for human merge."
+     gh pr comment <PR_NUMBER> --body "✅ **Review passed.** No P0/P1 findings."
 
 4. Update the task state via Symphony API:
    - If issues found: move to "address-comment"
      curl -X PUT http://localhost:8081/api/tasks/` + task.ID + ` -H "Content-Type: application/json" -d '{"state": "address-comment"}'
-   - If no issues: move to "human-review"
-     curl -X PUT http://localhost:8081/api/tasks/` + task.ID + ` -H "Content-Type: application/json" -d '{"state": "human-review"}'
+   - If no issues: move to "done"
+     curl -X PUT http://localhost:8081/api/tasks/` + task.ID + ` -H "Content-Type: application/json" -d '{"state": "done"}'
 
 5. STOP. Your job is done. The scheduler will handle the rest.
 
