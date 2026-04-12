@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -29,13 +30,13 @@ func processExists(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	
+
 	if runtime.GOOS == "windows" {
 		// Windows: use tasklist
 		cmd := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid))
 		return cmd.Run() == nil
 	}
-	
+
 	// Unix-like systems: use ps to check process state
 	if runtime.GOOS == "darwin" {
 		// macOS: use ps -o state
@@ -48,7 +49,7 @@ func processExists(pid int) bool {
 		// Check for zombie (Z) or empty state
 		return state != "" && state != "Z"
 	}
-	
+
 	// Linux: use /proc/<pid>/stat to check process state
 	if statBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
 		// Format: pid (comm) state ...
@@ -60,7 +61,7 @@ func processExists(pid int) bool {
 		}
 		return false
 	}
-	
+
 	// Fallback: use kill(pid, 0) to check existence
 	err := syscall.Kill(pid, 0)
 	if err == syscall.ESRCH {
@@ -84,19 +85,19 @@ type Scheduler struct {
 
 // RunningTask represents a currently executing task.
 type RunningTask struct {
-	Task        *store.Task
-	Agent       agent.Agent
-	CancelFunc  context.CancelFunc
-	StartTime   time.Time
+	Task       *store.Task
+	Agent      agent.Agent
+	CancelFunc context.CancelFunc
+	StartTime  time.Time
 }
 
 // SchedulerConfig holds scheduler-specific configuration.
 type SchedulerConfig struct {
-	PollInterval    time.Duration
-	MaxConcurrent   int
-	MaxRetries      int
-	RetryBaseDelay  time.Duration
-	RetryMaxDelay   time.Duration
+	PollInterval   time.Duration
+	MaxConcurrent  int
+	MaxRetries     int
+	RetryBaseDelay time.Duration
+	RetryMaxDelay  time.Duration
 }
 
 // NewScheduler creates a new scheduler instance.
@@ -250,7 +251,7 @@ func (s *Scheduler) handleRunningTask(ctx context.Context, task *store.Task) {
 				return
 			}
 		}
-		
+
 		// Task is marked running but not in our map and process is dead - orphaned state
 		logging.Warn("Found orphaned running task, marking as failed",
 			logging.String("task_id", task.ID),
@@ -779,18 +780,21 @@ func (s *Scheduler) startTask(ctx context.Context, task *store.Task) {
 		return
 	}
 	store.SetTaskWorkspace(s.db, task.ID, wsPath)
+	// Keep in-memory task state consistent with DB state for prompt generation.
+	task.State = targetRunningState
+	task.Workspace = wsPath
 
 	// Start task in goroutine
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		s.runTask(taskCtx, rt, task, wsPath)
-		
+
 		// Remove from running map after completion
 		s.mu.Lock()
 		delete(s.running, task.ID)
 		s.mu.Unlock()
-		
+
 		logging.Debug("Task removed from running map", logging.String("task_id", task.ID))
 	}()
 }
@@ -903,6 +907,28 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 			}
 			logging.ErrLog("Task failed with error", logging.String("task_id", task.ID), logging.String("error", errMsg))
 
+			// In self-review stage, agent/network errors can happen after review is already
+			// completed on GitHub. Avoid downgrading a completed review task to failed.
+			latestTask, getErr := store.GetTask(s.db, task.ID)
+			if getErr != nil {
+				logging.Warn("Failed to reload task during error handling",
+					logging.String("task_id", task.ID),
+					logging.Err(getErr))
+				latestTask = task
+			}
+
+			if s.shouldFinalizeReviewTaskOnError(latestTask) {
+				logging.Warn("Finalizing review task as done despite agent error",
+					logging.String("task_id", task.ID),
+					logging.String("error", errMsg))
+				store.UpdateTaskState(s.db, task.ID, store.StateDone, "")
+
+				s.mu.Lock()
+				delete(s.running, task.ID)
+				s.mu.Unlock()
+				return
+			}
+
 			// Update database state BEFORE removing from running map
 			// to prevent reconcile from seeing orphaned task.
 			s.handleTaskFailure(task, fmt.Errorf("%s", errMsg))
@@ -972,6 +998,160 @@ func (s *Scheduler) verifyTaskCompletion(task *store.Task) bool {
 	}
 
 	// Task ended without creating PR or making commits - not completed
+	return false
+}
+
+func (s *Scheduler) shouldFinalizeReviewTaskOnError(task *store.Task) bool {
+	if task == nil {
+		return false
+	}
+
+	if task.State != store.StateSelfReview && task.State != store.StateRunningReview {
+		return false
+	}
+
+	completed, reason, err := s.isSelfReviewCompletedOnGitHub(task)
+	if err != nil {
+		logging.Warn("Failed to validate self-review completion",
+			logging.String("task_id", task.ID),
+			logging.Err(err))
+		return false
+	}
+
+	if completed {
+		logging.Info("Self-review completion detected after error",
+			logging.String("task_id", task.ID),
+			logging.String("reason", reason))
+	}
+
+	return completed
+}
+
+type selfReviewCompletionSnapshot struct {
+	Reviews []struct {
+		State       string `json:"state"`
+		SubmittedAt string `json:"submittedAt"`
+		Body        string `json:"body"`
+	} `json:"reviews"`
+	Comments []struct {
+		Body string `json:"body"`
+	} `json:"comments"`
+	StatusCheckRollup []struct {
+		Status     string `json:"status"`
+		Conclusion string `json:"conclusion"`
+	} `json:"statusCheckRollup"`
+}
+
+func (s *Scheduler) isSelfReviewCompletedOnGitHub(task *store.Task) (bool, string, error) {
+	prNumber := task.PRNumber
+	if prNumber == 0 {
+		detectedNumber, detectedURL, err := s.getPRInfo(task)
+		if err != nil {
+			return false, "", fmt.Errorf("detect pr: %w", err)
+		}
+		if detectedNumber == 0 {
+			return false, "no pr", nil
+		}
+		prNumber = detectedNumber
+		store.SetTaskPR(s.db, task.ID, detectedNumber, detectedURL)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", strconv.Itoa(prNumber),
+		"-R", "tiancaiamao/ai", // TODO: make this configurable
+		"--json", "reviews,comments,statusCheckRollup")
+	if task.Workspace != "" {
+		if _, err := os.Stat(task.Workspace); err == nil {
+			cmd.Dir = task.Workspace
+		}
+	}
+
+	output, err := cmd.Output()
+	if err != nil {
+		return false, "", fmt.Errorf("gh pr view completion snapshot: %w", err)
+	}
+
+	var snapshot selfReviewCompletionSnapshot
+	if err := json.Unmarshal(output, &snapshot); err != nil {
+		return false, "", fmt.Errorf("parse completion snapshot: %w", err)
+	}
+
+	hasReview := false
+	for _, review := range snapshot.Reviews {
+		state := strings.ToUpper(strings.TrimSpace(review.State))
+		if state == "" || state == "PENDING" {
+			continue
+		}
+		hasReview = true
+		break
+	}
+
+	hasSelfReviewComment := false
+	for _, comment := range snapshot.Comments {
+		body := strings.ToLower(comment.Body)
+		if strings.Contains(body, "self-review") || strings.Contains(body, "self review") {
+			hasSelfReviewComment = true
+			break
+		}
+	}
+
+	if !hasReview && !hasSelfReviewComment {
+		return false, "no self-review signal", nil
+	}
+
+	if hasBlockingFindings(snapshot) {
+		return false, "blocking p0/p1 findings", nil
+	}
+
+	if hasBlockingChecks(snapshot.StatusCheckRollup) {
+		return false, "checks not green", nil
+	}
+
+	if hasReview {
+		return true, "review submitted and checks green", nil
+	}
+	return true, "self-review comment found and checks green", nil
+}
+
+func hasBlockingChecks(checks []struct {
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+}) bool {
+	for _, check := range checks {
+		status := strings.ToUpper(strings.TrimSpace(check.Status))
+		if status != "" && status != "COMPLETED" {
+			return true
+		}
+
+		conclusion := strings.ToUpper(strings.TrimSpace(check.Conclusion))
+		if conclusion == "" {
+			continue
+		}
+		switch conclusion {
+		case "SUCCESS", "NEUTRAL", "SKIPPED":
+			continue
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func hasBlockingFindings(snapshot selfReviewCompletionSnapshot) bool {
+	blockingPattern := regexp.MustCompile(`(?i)\bP[01]\b`)
+
+	for _, review := range snapshot.Reviews {
+		if blockingPattern.MatchString(review.Body) {
+			return true
+		}
+	}
+	for _, comment := range snapshot.Comments {
+		if blockingPattern.MatchString(comment.Body) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -1099,21 +1279,41 @@ Description:
 
 // replaceTemplateVars replaces template variables in the workflow content
 func (s *Scheduler) replaceTemplateVars(content string, task *store.Task) string {
-	// Simple variable replacement (can be enhanced with proper templating)
-	replacements := map[string]string{
-		"{{ task.id }}":     task.ID,
-		"{{ task.title }}":  task.Title,
-		"{{ task.description }}": task.Description,
-		"{{ task.state }}":  string(task.State),
-		"{{ task.labels }}": "",
-		"{{ task.url }}":    fmt.Sprintf("http://localhost:8080/tasks/%s", task.ID),
-		"{{.TaskID }}":      task.ID,
-		"{{.TaskTitle }}":   task.Title,
-		"{{.Repo }}":        "your-org/your-repo", // TODO: from config
-		"{{.Workspace }}":   task.Workspace,
+	result := content
+
+	// Render minimal control blocks used by workflow templates.
+	// 1) {% if attempt %} ... {% endif %}
+	attemptPattern := regexp.MustCompile(`(?s)\{%\s*if\s+attempt\s*%\}(.*?)\{%\s*endif\s*%\}`)
+	if task.RetryCount > 0 {
+		result = attemptPattern.ReplaceAllString(result, "$1")
+	} else {
+		result = attemptPattern.ReplaceAllString(result, "")
 	}
 
-	result := content
+	// 2) {% if task.description %} ... {% else %} ... {% endif %}
+	descriptionPattern := regexp.MustCompile(`(?s)\{%\s*if\s+task\.description\s*%\}(.*?)\{%\s*else\s*%\}(.*?)\{%\s*endif\s*%\}`)
+	if strings.TrimSpace(task.Description) != "" {
+		result = descriptionPattern.ReplaceAllString(result, "$1")
+	} else {
+		result = descriptionPattern.ReplaceAllString(result, "$2")
+	}
+
+	// Simple variable replacement
+	taskURL := fmt.Sprintf("http://localhost:%d/tasks/%s", s.cfg.Server.Port, task.ID)
+	replacements := map[string]string{
+		"{{ task.id }}":          task.ID,
+		"{{ task.title }}":       task.Title,
+		"{{ task.description }}": task.Description,
+		"{{ task.state }}":       string(task.State),
+		"{{ task.labels }}":      "",
+		"{{ task.url }}":         taskURL,
+		"{{ attempt }}":          strconv.Itoa(task.RetryCount),
+		"{{.TaskID }}":           task.ID,
+		"{{.TaskTitle }}":        task.Title,
+		"{{.Repo }}":             "your-org/your-repo", // TODO: from config
+		"{{.Workspace }}":        task.Workspace,
+	}
+
 	for placeholder, value := range replacements {
 		result = strings.ReplaceAll(result, placeholder, value)
 	}
@@ -1139,29 +1339,38 @@ func (s *Scheduler) addStateSpecificInstructions(prompt string, task *store.Task
 
 ## Current Status: Self Review
 
-A PR has been created for this task. Your job is to review it:
+A PR has been created for this task. Your ONLY job is to review it and leave a comment.
 
-1. Use the review skill to review your own PR:
-   /skill:review review PR #$(gh pr view --json number -q .number)
+**CRITICAL RULES:**
+- You MUST NOT edit, fix, or write any code.
+- You MUST NOT commit or push anything.
+- You MUST leave a comment on the PR with your review result.
 
-2. Read the review result from the output file
+Steps:
 
-3. If there are P0 or P1 findings:
-   - Move task to address-comment: Update task state to "address-comment"
-   - Document findings in the workpad
-   - STOP and wait for next instruction
+1. Get the PR diff:
+   gh pr diff <PR_NUMBER>
 
-4. If there are NO P0 or P1 findings:
-   - AI self-approve the PR:
-     gh pr review --approve --body "AI self-review passed. No P0/P1 findings. Ready for human merge."
-   - Poll for external feedback:
-     gh pr checks
-     gh pr view --comments
-   - If external feedback requires changes, move to "address-comment"
-   - If all checks pass and no actionable feedback:
-     - Move task to "done" state
+2. Review the diff carefully. Check for bugs, logic errors, missing tests, style issues.
 
-DO NOT make new code changes during self-review. Only review the existing PR.
+3. Leave a comment on the PR with your findings:
+   - If there are P0 or P1 findings:
+     gh pr comment <PR_NUMBER> --body "🔍 **Review found issues:**
+     - [P1] <finding description>
+     ...
+     Please address these before merge."
+   - If there are NO P0/P1 findings:
+     gh pr comment <PR_NUMBER> --body "✅ **Review passed.** No P0/P1 findings. Ready for human merge."
+
+4. Update the task state via Symphony API:
+   - If issues found: move to "address-comment"
+     curl -X PUT http://localhost:8081/api/tasks/` + task.ID + ` -H "Content-Type: application/json" -d '{"state": "address-comment"}'
+   - If no issues: move to "human-review"
+     curl -X PUT http://localhost:8081/api/tasks/` + task.ID + ` -H "Content-Type: application/json" -d '{"state": "human-review"}'
+
+5. STOP. Your job is done. The scheduler will handle the rest.
+
+NOTE: You CANNOT approve your own PR (GitHub restriction). Leaving a comment is sufficient.
 `
 
 	case "address-comment":
@@ -1264,6 +1473,7 @@ Stop and exit.
 
 	return prompt
 }
+
 // getPRInfo fetches PR information for a task.
 func (s *Scheduler) getPRInfo(task *store.Task) (prNumber int, prURL string, err error) {
 	if task.Workspace == "" {

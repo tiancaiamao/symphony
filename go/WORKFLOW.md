@@ -64,6 +64,17 @@ Instructions:
 
 Work only in the provided repository copy. Do not touch any other path.
 
+## Symphony API
+
+The Symphony orchestration server is available at `http://localhost:8081`. Use it to transition task states:
+
+```bash
+# Move task to a new state (valid states: inbox, todo, running, self-review, address-comment, human-review, merging, rework, done)
+curl -X PUT http://localhost:8081/api/tasks/{{ task.id }} \
+  -H "Content-Type: application/json" \
+  -d '{"state": "self-review"}'
+```
+
 ## Prerequisite: GitHub CLI is available
 
 The agent should be able to talk to GitHub via `gh` CLI. If `gh` is not available, stop and ask the user to install it.
@@ -143,28 +154,30 @@ For commit and push, use direct git commands (see Step 2).
 
 ## Step 3: Self Review
 
-1. Use the `review` skill to review your own PR:
+1. Get the PR diff and review it:
    ```bash
-   /skill:review review PR #$(gh pr view --json number -q .number)
+   gh pr diff $(gh pr view --json number -q .number)
    ```
-2. Read the review result from the output file.
-3. If there are P0 or P1 findings:
-   - Move task to `Address Comment`.
-   - Document findings in the workpad.
-4. If there are NO P0/P1 findings:
-   - AI self-approve the PR:
+2. Leave a comment on the PR with your findings:
+   - Issues found:
      ```bash
-     gh pr review --approve --body "🤖 AI self-review passed. No P0/P1 findings. Ready for human merge."
+     gh pr comment <PR_NUMBER> --body "🔍 **Review found issues:** ..."
      ```
-   - Poll external feedback (CI checks, bot comments):
+   - No issues:
      ```bash
-     gh pr checks
-     gh pr view --comments
+     gh pr comment <PR_NUMBER> --body "✅ **Review passed.** No P0/P1 findings."
      ```
-   - If external feedback requires changes:
-     - Move task to `Address Comment`.
-   - If all checks pass and no actionable feedback:
-     - Move task to `Human Review`.
+3. Update task state via Symphony API:
+   - Issues found → `"address-comment"`
+   - No issues → `"human-review"`
+   ```bash
+   curl -X PUT http://localhost:8081/api/tasks/{{ task.id }} \
+     -H "Content-Type: application/json" \
+     -d '{"state": "human-review"}'
+   ```
+4. STOP. Do NOT edit code, commit, or push during self-review.
+
+NOTE: You cannot approve your own PR (GitHub restriction). A comment is sufficient.
 
 ## Step 4: Address Comment
 
