@@ -84,12 +84,11 @@ The agent should be able to talk to GitHub via `gh` CLI. If `gh` is not availabl
 
 ## Related skills
 
-- `github`: interact with GitHub (create PR, comment, etc.)
-- `commit`: produce clean, logical commits during implementation.
-- `push`: keep remote branch current and publish updates.
-- `pull`: keep branch updated with latest `origin/main` before handoff.
+- `github`: interact with GitHub (create PR, comment, etc.) via `gh` CLI.
 - `land`: when task reaches `Merging`, execute the land skill to merge the PR.
 - `review`: when task reaches `Self Review`, use the review skill to review the PR.
+
+For commit and push, use direct git commands (see Step 2).
 
 ## Status map
 
@@ -123,7 +122,7 @@ The agent should be able to talk to GitHub via `gh` CLI. If `gh` is not availabl
 2. Build a concrete plan with explicit checklist items in the workpad.
 3. Implement the minimal change that addresses the issue.
 4. Run tests and validation to confirm the fix.
-5. Commit changes using the `commit` skill:
+5. Commit changes:
    ```bash
    git add -A
    git commit -m "Fix: {{ task.title }}"
