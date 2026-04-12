@@ -855,7 +855,7 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 		case agent.EventAgentEnd:
 			// Reload task from database to get latest state (PRNumber, etc.)
 			// The task object passed to runTask is stale - it doesn't reflect
-			// updates made during agent execution (like PR creation)
+			// updates made during agent execution (like PR creation or state transitions)
 			latestTask, err := store.GetTask(s.db, task.ID)
 			if err != nil {
 				logging.ErrLog("Failed to reload task", logging.String("task_id", task.ID), logging.Err(err))
@@ -863,18 +863,33 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 				latestTask = task
 			}
 
+			// If the agent already transitioned the task to a non-running state, respect that.
+			// The agent may have moved the task to human-review, address-comment, done, etc.
+			// Only apply default state transitions if the agent didn't change the state.
+			originalState := task.State
+			currentState := latestTask.State
+
+			if currentState != originalState && currentState != store.StateRunningReview && currentState != store.StateRunningAddressComment {
+				// Agent already transitioned the state — respect it
+				logging.Info("Agent already transitioned task state, respecting it",
+					logging.String("task_id", task.ID),
+					logging.String("original_state", string(originalState)),
+					logging.String("new_state", string(currentState)))
+
+				s.mu.Lock()
+				delete(s.running, task.ID)
+				s.mu.Unlock()
+				return
+			}
+
 			// Verify that the task actually completed successfully
-			// Check if task has PR (for non-review tasks) or other completion indicators
 			completedSuccessfully := s.verifyTaskCompletion(latestTask)
 
 			if completedSuccessfully {
 				logging.Info("Task completed successfully", logging.String("task_id", task.ID))
 
-				// Update database state BEFORE removing from running map.
-				// This prevents the race where reconcile's handleRunningTask sees
-				// RunningReview state, task not in s.running, and marks it orphaned.
-				if latestTask.State == store.StateSelfReview || latestTask.State == store.StateAddressComment ||
-					latestTask.State == store.StateRunningReview || latestTask.State == store.StateRunningAddressComment {
+				if currentState == store.StateSelfReview || currentState == store.StateAddressComment ||
+					currentState == store.StateRunningReview || currentState == store.StateRunningAddressComment {
 					// Review tasks are done - move to Done state
 					store.UpdateTaskState(s.db, task.ID, store.StateDone, "")
 				} else {
@@ -882,7 +897,6 @@ func (s *Scheduler) runTask(ctx context.Context, rt *RunningTask, task *store.Ta
 					store.UpdateTaskState(s.db, task.ID, store.StateSelfReview, "")
 				}
 
-				// Now safe to remove from running map
 				s.mu.Lock()
 				delete(s.running, task.ID)
 				s.mu.Unlock()
