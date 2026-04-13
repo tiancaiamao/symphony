@@ -132,7 +132,7 @@ For commit and push, use direct git commands (see Step 2).
 4. Run tests and validation to confirm the fix.
 5. Commit changes:
    ```bash
-   git add -A
+   git add -A -- ':!WORKPAD.md' ':!WORKFLOW.md'
    git commit -m "Fix: {{ task.title }}"
    ```
 6. Push branch:
@@ -185,7 +185,7 @@ NOTE: You cannot approve your own PR (GitHub restriction). A comment is sufficie
    - Update tests if needed.
 3. Commit and push changes:
    ```bash
-   git add -A
+   git add -A -- ':!WORKPAD.md' ':!WORKFLOW.md'
    git commit -m "Address review comments"
    git push origin {{ task.id }}
    ```

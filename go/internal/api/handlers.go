@@ -164,6 +164,29 @@ func (h *Handlers) DeleteTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get task before deletion to check for workspace cleanup
+	task, err := store.GetTask(h.db, id)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to get task: "+err.Error())
+		return
+	}
+	if task == nil {
+		respondError(w, http.StatusNotFound, "Task not found")
+		return
+	}
+
+	// Clean up workspace if it exists
+	if task.Workspace != "" {
+		// Run before_remove hook to clean up git worktree
+		if h.scheduler != nil {
+			if err := h.scheduler.CleanupWorkspace(r.Context(), task.Workspace, task.ID, task.ID); err != nil {
+				respondError(w, http.StatusInternalServerError, "Failed to cleanup workspace: "+err.Error())
+				return
+			}
+		}
+	}
+
+	// Delete task from database
 	if err := store.DeleteTask(h.db, id); err != nil {
 		respondError(w, http.StatusNotFound, "Task not found: "+err.Error())
 		return

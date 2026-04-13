@@ -439,6 +439,41 @@ func (s *Scheduler) handleArchiveTask(ctx context.Context, task *store.Task) {
 	}
 }
 
+// CleanupWorkspace cleans up a task's workspace directory and git worktree.
+// This is a public method used by the DeleteTask API handler.
+func (s *Scheduler) CleanupWorkspace(ctx context.Context, workspacePath string, taskID string, branchName string) error {
+	// First, run before_remove hook to clean up git worktree
+	// This ensures git worktree metadata is properly removed before deleting the directory
+	if s.cfg.Hooks.BeforeRemove != "" {
+		if err := s.workspace.RunHook(s.cfg.Hooks.BeforeRemove, workspacePath, taskID, branchName); err != nil {
+			logging.Warn("Failed to run before_remove hook for workspace cleanup",
+				logging.String("task_id", taskID),
+				logging.String("workspace", workspacePath),
+				logging.Err(err))
+			// Continue anyway - the hook has fallback error handling
+		} else {
+			logging.Info("Git worktree removed via before_remove hook",
+				logging.String("task_id", taskID),
+				logging.String("workspace", workspacePath))
+		}
+	}
+
+	// Then remove workspace directory
+	if err := s.workspace.Remove(workspacePath); err != nil {
+		logging.ErrLog("Failed to cleanup workspace directory",
+			logging.String("task_id", taskID),
+			logging.String("workspace", workspacePath),
+			logging.Err(err))
+		return err
+	}
+
+	logging.Info("Workspace cleaned up",
+		logging.String("task_id", taskID),
+		logging.String("workspace", workspacePath))
+
+	return nil
+}
+
 // checkPRClosed checks if the PR for a task has been merged or closed.
 func (s *Scheduler) checkPRClosed(task *store.Task) (bool, string, error) {
 	// Run gh pr view to check PR status (both merged and closed)
@@ -592,6 +627,98 @@ func (s *Scheduler) checkForNewComments(task *store.Task) (bool, error) {
 
 		// Found a new human comment!
 		logging.Info("Found new comment on PR",
+			logging.String("task_id", task.ID),
+			logging.String("author", authorLogin))
+
+		return true, nil
+	}
+
+	// Also check PR review comments (inline code review comments).
+	// gh pr view --json comments only returns issue-level comments,
+	// but humans typically leave inline review comments via the GitHub PR review UI.
+	reviewHasNew, err := s.checkForNewReviewComments(task, completionTime)
+	if err != nil {
+		logging.Debug("Failed to check PR review comments",
+			logging.String("task_id", task.ID),
+			logging.Err(err))
+	} else if reviewHasNew {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// checkForNewReviewComments checks for new PR review comments (inline code comments)
+// since the given completion time.
+func (s *Scheduler) checkForNewReviewComments(task *store.Task, completionTime time.Time) (bool, error) {
+	if task.PRNumber == 0 {
+		return false, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Use GitHub API to fetch review comments (distinct from issue comments)
+	cmd := exec.CommandContext(ctx, "gh", "api",
+		fmt.Sprintf("repos/tiancaiamao/ai/pulls/%d/comments", task.PRNumber),
+		"--jq", ".[] | [.created_at, .user.login] | @json")
+
+	if task.Workspace != "" {
+		if _, err := os.Stat(task.Workspace); err == nil {
+			cmd.Dir = task.Workspace
+		}
+	}
+
+	output, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("gh api review comments: %w", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "null" {
+			continue
+		}
+
+		var commentData []json.RawMessage
+		if err := json.Unmarshal([]byte(line), &commentData); err != nil {
+			continue
+		}
+		if len(commentData) < 2 {
+			continue
+		}
+
+		var createdAtStr string
+		if err := json.Unmarshal(commentData[0], &createdAtStr); err != nil {
+			continue
+		}
+
+		createdAt, err := time.Parse(time.RFC3339, createdAtStr)
+		if err != nil {
+			continue
+		}
+
+		if !createdAt.After(completionTime) {
+			continue
+		}
+
+		var authorLogin string
+		if err := json.Unmarshal(commentData[1], &authorLogin); err != nil {
+			continue
+		}
+
+		// Skip bot comments
+		isBot := strings.Contains(authorLogin, "bot") ||
+			strings.Contains(authorLogin, "Bot") ||
+			authorLogin == "github-actions[bot]" ||
+			authorLogin == "dependabot[bot]"
+
+		if isBot {
+			continue
+		}
+
+		logging.Info("Found new review comment on PR",
 			logging.String("task_id", task.ID),
 			logging.String("author", authorLogin))
 
@@ -1405,7 +1532,7 @@ There are review comments or feedback on the PR that need to be addressed:
    - Update tests if needed
 
 3. Commit and push changes:
-   git add -A
+   git add -A -- ':!WORKPAD.md' ':!WORKFLOW.md'
    git commit -m "Address review comments"
    git push origin <task-branch>
 
