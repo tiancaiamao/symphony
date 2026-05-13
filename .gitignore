@@ -1,0 +1,17 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Worktrees
+.worktrees/
+worktrees/
+
+# Build output
+bin/
+*.exe
+*.test
+
+# Logs
+*.log
