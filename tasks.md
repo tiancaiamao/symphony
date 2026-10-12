@@ -27,7 +27,7 @@
   - PromptRequest struct (Type, Message)
   - RPCResponse struct (Type, Content, Error)
 - [ ] Create `internal/agent/runner.go` - Implement StartAgent:
-  - Exec cmd: `~/project/ai/bin/ai --mode rpc --session <workspace>/.session.jsonl`
+    - Exec cmd: `~/project/ai/bin/ai rpc --session <workspace>/.session.jsonl`
   - Set cmd.Dir = workspace
   - Get stdin/stdout pipes
 - [ ] Implement SendPrompt function - Send PromptRequest JSON to stdin

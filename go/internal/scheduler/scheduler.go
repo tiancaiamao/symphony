@@ -223,6 +223,11 @@ func (s *Scheduler) handleRunningTask(ctx context.Context, task *store.Task) {
 	s.mu.RUnlock()
 
 	if !exists {
+		logging.Warn("handleRunningTask: task not in running map",
+			logging.String("task_id", task.ID),
+			logging.Int("agent_pid", task.AgentPID),
+			logging.String("state", string(task.State)))
+
 		// Check if the agent process is actually running
 		if task.AgentPID > 0 {
 			// Verify if the process exists
@@ -884,7 +889,12 @@ func (s *Scheduler) startTask(ctx context.Context, task *store.Task) {
 	// This prevents race condition where handleRunningTask sees running in DB but not in map
 	s.mu.Lock()
 	s.running[task.ID] = rt
+	mapSize := len(s.running)
 	s.mu.Unlock()
+
+	logging.Info("startTask: added task to running map",
+		logging.String("task_id", task.ID),
+		logging.Int("map_size", mapSize))
 
 	// Determine the target running state based on the original task state
 	// This allows UI to distinguish between different types of running tasks
@@ -1368,13 +1378,19 @@ func (s *Scheduler) RetryTask(ctx context.Context, taskID string) error {
 	}
 	task.RetryCount = newCount
 
-	// Transition to running
-	if err := store.UpdateTaskState(s.db, taskID, store.StateRunning, ""); err != nil {
-		return fmt.Errorf("update task state: %w", err)
-	}
+	// DON'T update DB state to "running" here.
+	// Let startTask handle the state transition after adding the task to
+	// the running map. Otherwise, the reconcile loop can see "running" in
+	// the DB before the task is in the scheduler's running map, triggering
+	// the "manually moved to running" guard in handleRunningTask.
+	//
+	// Set in-memory state to StateRunning so startTask's workspace logic
+	// (which checks task.State == StateTodo for new-workspace creation)
+	// will reuse the existing workspace instead of creating a new one.
 	task.State = store.StateRunning
 
-	// Start the task
+	// Start the task — startTask will update DB state to "running"
+	// after registering the task in the running map.
 	s.startTask(ctx, task)
 
 	return nil

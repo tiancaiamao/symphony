@@ -141,7 +141,7 @@ func (r *AgentRunner) Start(task *Task, workspace string) error {
     // 1. Start ai process
     cmd := exec.Command(
         filepath.Join(r.aiPath, "bin/ai"),
-        "--mode", "rpc",
+                "rpc",
         "--session", filepath.Join(workspace, ".session.jsonl"),
     )
     cmd.Dir = workspace

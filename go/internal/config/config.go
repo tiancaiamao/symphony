@@ -92,7 +92,7 @@ func Load(workflowCfg map[string]interface{}) (*Config, error) {
 		Agent: AgentConfig{
 			Kind:               getString(workflowCfg, "agent", "kind", "ai"),
 			Command:            getString(workflowCfg, "agent", "command", "ai"),
-			Args:               getStringSlice(workflowCfg, "agent", "args", []string{"--mode", "rpc"}),
+									Args:               getStringSlice(workflowCfg, "agent", "args", []string{"serve"}),
 			MaxConcurrentAgents: getInt(workflowCfg, "agent", "max_concurrent_agents", 10),
 			MaxTurns:           getInt(workflowCfg, "agent", "max_turns", 20),
 			MaxRetryBackoffMs:  getInt(workflowCfg, "agent", "max_retry_backoff_ms", 300000),

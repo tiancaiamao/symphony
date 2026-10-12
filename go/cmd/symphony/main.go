@@ -15,6 +15,7 @@ import (
 	httpserver "symphonia/internal/http"
 	"symphonia/internal/logging"
 	"symphonia/internal/scheduler"
+	"symphonia/internal/singleton"
 	"symphonia/internal/store"
 	"symphonia/internal/workspace"
 )
@@ -68,6 +69,16 @@ func main() {
 		logging.ErrLog("Failed to create database directory", logging.Err(err))
 		os.Exit(1)
 	}
+
+	// Acquire single-instance lock on the database
+	lockPath := db + ".lock"
+	instanceLock, err := singleton.Acquire(lockPath)
+	if err != nil {
+		logging.ErrLog("Failed to acquire instance lock", logging.Err(err))
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer instanceLock.Release()
 
 	// Initialize database
 	database, err := store.InitDB(db)
@@ -181,8 +192,7 @@ agent:
   kind: ai
   command: ai
   args:
-    - "--mode"
-    - "rpc"
+  - "serve"
   max_concurrent_agents: 3
   max_turns: 20
   max_retry_backoff_ms: 300000

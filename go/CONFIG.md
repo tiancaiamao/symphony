@@ -130,15 +130,19 @@ export SLACK_WEBHOOK="https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
 # 检查 ai 命令是否存在
 which ai
 
-# 如果不存在，添加到 PATH
-export PATH="$HOME/project/ai/bin:$PATH"
+# 如果不存在，添加到 PATH（注意：要指向能用的那个构建，旧的构建里没有 serve/send 契约）
+export PATH="$HOME/go/bin:$PATH"
 
 # 或者修改 config.yaml
 agent:
   kind: ai
-  command: ~/project/ai/bin/ai  # ← 指定完整路径
-  args: ["--mode", "rpc"]
+  command: ai              # ← 或写绝对路径，例如 ~/go/bin/ai
+  args: ["serve"]          # ← 子命令；其余 flag 由 internal/agent/ai 自动追加
 ```
+
+`args` 只是基础子命令，Symphony 会在它后面追加 `--id-file` / `--name` / `--model`
+等参数，并由 `ai send` / `ai kill` 驱动整个会话（详见 `internal/agent/ai/ai.go`
+包注释）。
 
 ### 7. 配置 Git
 
@@ -251,8 +255,9 @@ symphony board
 which ai
 ai --version
 
-# 检查 RPC 模式
-ai --mode rpc --help
+# 检查 serve/send 子命令
+ai serve --help
+ai send --help
 
 # 检查 PATH
 echo $PATH

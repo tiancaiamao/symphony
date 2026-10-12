@@ -136,16 +136,32 @@ func (h *Handlers) UpdateTask(w http.ResponseWriter, r *http.Request) {
 	if req.Description != nil {
 		description = *req.Description
 	}
-	
+
 	// Update basic fields
 	if err := store.UpdateTask(h.db, id, title, description); err != nil {
 		respondError(w, http.StatusInternalServerError, "Failed to update task: "+err.Error())
 		return
 	}
-	
+
 	// Update state if provided
 	if req.State != nil && *req.State != task.State {
-		if err := store.UpdateTaskState(h.db, id, *req.State, ""); err != nil {
+		targetState := *req.State
+
+		// If someone tries to move a task directly to "running", route it through
+		// the scheduler instead of just flipping the DB state. Direct DB state
+		// change to "running" bypasses startTask, causing the scheduler to treat
+		// it as an orphaned/manual drag and immediately fail it.
+		// For failed tasks, use the /retry endpoint instead.
+		if targetState == store.StateRunning {
+			if task.State == store.StateFailed {
+				respondError(w, http.StatusBadRequest, "Use POST /api/tasks/"+id+"/retry to retry a failed task")
+				return
+			}
+			// Route through todo so the scheduler picks it up properly.
+			targetState = store.StateTodo
+		}
+
+		if err := store.UpdateTaskState(h.db, id, targetState, ""); err != nil {
 			respondError(w, http.StatusInternalServerError, "Failed to update task state: "+err.Error())
 			return
 		}
@@ -221,11 +237,11 @@ func (h *Handlers) GetStatus(w http.ResponseWriter, r *http.Request) {
 	runningTasks := h.scheduler.GetRunningTasks()
 
 	type RunInfo struct {
-		TaskID     string `json:"task_id"`
-		Title      string `json:"title"`
-		Workspace  string `json:"workspace"`
-		StartTime  string `json:"start_time"`
-		ElapsedMs  int64  `json:"elapsed_ms"`
+		TaskID    string `json:"task_id"`
+		Title     string `json:"title"`
+		Workspace string `json:"workspace"`
+		StartTime string `json:"start_time"`
+		ElapsedMs int64  `json:"elapsed_ms"`
 	}
 
 	runs := make([]RunInfo, 0, len(runningTasks))
